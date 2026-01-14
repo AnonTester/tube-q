@@ -1,0 +1,50 @@
+name: tube-q
+services:
+  tube-q:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tube-q:latest
+    container_name: tube-q
+    restart: unless-stopped
+    ports:
+      - "7090:7090"
+    volumes:
+      # Config directory
+      - /opt/tube-q/conf:/app/conf
+
+      # Downloads directories
+      - /mnt/download/YT-DLP:/downloads
+      - /media:/media
+      - /mnt:/mnt
+
+      # Optional: override binaries
+      #- /usr/bin:/binaries:ro
+      - /usr/bin/ffmpeg:/usr/bin/ffmpeg
+      - /usr/bin/ffprobe:/usr/bin/ffprobe
+
+    environment:
+      YT_DLP_BINARY: "/usr/bin/yt-dlp"
+      FFMPEG_BINARY: "/usr/bin/ffmpeg"
+      FFPROBE_BINARY: "/usr/bin/ffprobe"
+
+    healthcheck:
+      interval: 2m
+      retries: 5
+      start_period: 30s
+      test: curl -f http://localhost:7090/health || exit 1
+      timeout: 10s
+
+
+# AMD/Intel GPUS:
+    devices:
+      - /dev/dri:/dev/dri
+
+# NVIDIA GPUS:
+#    deploy:
+#      resources:
+#        reservations:
+#          devices:
+#            - driver: nvidia
+#              count: all
+#              capabilities: [gpu]

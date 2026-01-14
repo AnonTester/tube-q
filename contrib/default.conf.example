@@ -1,0 +1,17 @@
+# Convert m3u8 streams to mp4
+--recode-video m3u8>mp4
+
+# Save all videos under YT-DL directory in your home directory with resolution if available
+# https://github.com/yt-dlp/yt-dlp#output-template
+-o /download/%(webpage_url_domain)s/%(title)s.%(height&{}p.|)s%(ext)s
+# resolution res height
+
+# Download the best video available with the largest resolution but no better than 720p,
+-S "res:720"
+
+# Number of retries for a fragment (default is 10), or "infinite" (DASH, hlsnative and ISM)
+--fragment-retries 20
+
+# Time to sleep between retries in seconds (optionally) prefixed by the type of retry (http (default), fragment, file_access, extractor) to apply the sleep to. EXPR can be a number, linear=START[:END[:STEP=1]] or exp=START[:END[:BASE=2]]. This option can be used multiple times to set the sleep for the different retry types, e.g. --retry-sleep linear=1::2 --retry-sleep fragment:exp=1:20
+--retry-sleep exp=1:20
+
