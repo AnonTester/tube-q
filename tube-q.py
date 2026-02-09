@@ -2,7 +2,7 @@
 """
 Tube-Q : yt-dlp Tube Download Queue
 """
-APP_VERSION = "1.9.9"
+APP_VERSION = "1.9.10"
 
 import asyncio
 import json
@@ -568,6 +568,8 @@ INDEX_HTML = r"""
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <link rel="icon" type="image/ico" href="favicon.ico">
   <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
   <style>
     :root{--bg:#f7f7f8;--fg:#111;--card:#fff;--muted:#666;--accent:#3b82f6}
     @media (prefers-color-scheme: dark){:root{--bg:#0b0b0d;--fg:#e6e6e6;--card:#212529;--muted:#999;--accent:#3b82f6}}
@@ -900,12 +902,13 @@ INDEX_HTML = r"""
 <div id="updateOverlay" class="overlay">
     <div class="modal" id="updateModal">
         <div class="modal-header">
-            <h3>Update yt-dlp</h3>
+            <h3>Updated yt-dlp version available</h3>
             <button id="updateClose">&#10005;</button>
         </div>
         <div class="modal-content">
-            <p>A new yt-dlp version (<span id="latestVerText"></span>) is available.</p>
-            <p>Download and install the latest binary?</p>
+            <p>New version: <span id="latestVerText"></span></p>
+            <p>Current version: <span id="currentVerText"></span></p>
+            <p>Should the latest yt-dlp binary be downloaded and installed?</p>
             <div class="btn-row">
                 <button class="ghost btn-cancel" id="updateCancel">Cancel</button>
                 <button id="updateConfirm">Update</button>
@@ -1401,31 +1404,14 @@ INDEX_HTML = r"""
     }
 
     fetch('/version').then(r => r.json()).then(j => {
-        document.getElementById('ytdlpVer').innerText = j.yt_dlp_version || 'unknown';
+        const localVer = j.yt_dlp_version || 'unknown';
+        const latestVer = j.latest_ytdlp || '';
+        document.getElementById('ytdlpVer').innerText = localVer;
         document.getElementById('appVer').innerText = j.app_version || 'unknown';
+        document.getElementById('currentVerText').innerText = localVer;
+        document.getElementById('latestVerText').innerText = latestVer;
         // render update link area if needed
-        renderUpdateArea(Boolean(j.latest_ytdlp && (j.yt_dlp_version !== j.latest_ytdlp)), j.latest_ytdlp);
-    });
-
-    fetch('/status').then(r => r.json()).then(status => {
-        const updateAvailable = status.update_available;
-
-        // Update footer with update link if new version is available
-        if (updateAvailable) {
-            document.getElementById('latestVerText').innerText = status.latest_ytdlp || '';
-            const footer = document.getElementById('footer');
-            const updateLink = document.createElement('a');
-            updateLink.href = '#';
-            updateLink.style.color = 'yellow';
-            updateLink.textContent = 'apply update';
-            updateLink.onclick = (e) => {
-                e.preventDefault();
-                // show the update confirmation modal
-                document.getElementById('updateOverlay').style.display = 'flex';
-            };
-            footer.appendChild(document.createTextNode(' '));
-            footer.appendChild(updateLink);
-        }
+        renderUpdateArea(Boolean(latestVer && (localVer !== latestVer)), latestVer);
     });
 
     function renderUpdateArea(available, latest) {
