@@ -2,7 +2,7 @@
 """
 Tube-Q : yt-dlp Tube Download Queue
 """
-APP_VERSION = "1.9.10"
+APP_VERSION = "1.10.0"
 
 import asyncio
 import json
@@ -599,6 +599,10 @@ INDEX_HTML = r"""
     @keyframes spin{to{transform:rotate(360deg)}}
     button{padding:6px 10px;border-radius:6px;border:0;background:var(--accent);color:white;cursor:pointer}
     button.ghost{background:transparent;border:1px solid rgba(0,0,0,0.06);color:var(--muted)}
+    .mobile-icon-btn{font-weight:700;line-height:1}
+    .mobile-icon-btn.icon-retry{color:#16a34a}
+    .mobile-icon-btn.icon-log{color:var(--fg)}
+    .mobile-icon-btn.icon-remove{color:#dc2626}
     .muted{color:var(--muted)}
     .status-icon{width:12px;height:12px;border-radius:3px;display:inline-block}
     .status-paused{background:orange}
@@ -700,8 +704,6 @@ INDEX_HTML = r"""
 
     /* Mobile layout override */
     @media (max-width:600px){
-      .small{display:none}
-
       /* Allow URLs to wrap up to 2 lines */
       .url-text{
         white-space: normal;
@@ -761,6 +763,9 @@ INDEX_HTML = r"""
       }
 
       .item .bottom-row {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
         width: 100%;
         margin-top: 4px;
         text-align: left; /* keep URL/status left-aligned */
@@ -768,8 +773,23 @@ INDEX_HTML = r"""
       }
 
       .item button {
-        padding: 4px 6px;
-        font-size: 0.8rem;
+        padding: 3px 5px;
+        font-size: 0.74rem;
+      }
+
+      .item button.mobile-icon-btn {
+        background: transparent;
+        border: 1px solid rgba(127,127,127,0.45);
+        color: var(--fg);
+        min-width: 24px;
+        padding: 2px 4px;
+        font-size: 0.95rem;
+      }
+
+      .item .progress {
+        width: 100%;
+        min-width: 0;
+        margin: 0;
       }
 
       .url-text {
@@ -1069,6 +1089,37 @@ INDEX_HTML = r"""
         return 'queued';
     }
 
+    function isMobileViewport() {
+        const vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+        return vw > 0 && vw <= 600;
+    }
+
+    function statusSortRank(status) {
+        if (status === 'downloading' || status === 'postprocessing' || status === 'processing' || status === 'waiting') return 0;
+        if (status === 'queued' || status === 'paused') return 1;
+        if (status === 'error' || status === 'stalled' || status === 'cancelled') return 2;
+        if (status === 'duplicate') return 3;
+        if (status === 'completed') return 4;
+        return 1;
+    }
+
+    function sortQueueItems(items) {
+        return (Array.isArray(items) ? items.slice() : []).sort((a, b) => {
+            const sa = itemStatus(a);
+            const sb = itemStatus(b);
+            const ra = statusSortRank(sa);
+            const rb = statusSortRank(sb);
+            if (ra !== rb) return ra - rb;
+            if (ra === 4) {
+                const byCompleted = (b.completed_at || 0) - (a.completed_at || 0);
+                if (byCompleted !== 0) return byCompleted;
+            }
+            const byAdded = (b.added_at || 0) - (a.added_at || 0);
+            if (byAdded !== 0) return byAdded;
+            return String(a.id || '').localeCompare(String(b.id || ''));
+        });
+    }
+
     function statusIcon(status) {
         if (status === 'paused') return '<span class="status-icon status-paused" title="paused"></span>';
         if (status === 'downloading' || status === 'postprocessing') return '<span class="status-icon status-downloading" title="downloading/postprocessing"></span>';
@@ -1090,35 +1141,54 @@ INDEX_HTML = r"""
         const favicon = it.favicon || '_generic.ico';
         const id = it.id;
         const url = it.url;
+        const mobile = isMobileViewport();
         let rightButtons = '';
         if (status === 'paused') rightButtons += `<button onclick="resumeQueued('${id}')">Resume</button> `;
-        if (status === 'error' || status === 'stalled' || status === 'duplicate') rightButtons += `<button onclick="retryItem('${id}')">Retry</button> `;
-        if (status === 'completed' || status === 'error' || status === 'stalled') rightButtons += `<button onclick="openLog('${id}')">Log</button> `;
+        if (status === 'error' || status === 'stalled' || status === 'duplicate') {
+            rightButtons += mobile
+                ? `<button class="mobile-icon-btn icon-retry" title="Retry" aria-label="Retry" onclick="retryItem('${id}')">↻</button> `
+                : `<button onclick="retryItem('${id}')">Retry</button> `;
+        }
+        if (status === 'completed' || status === 'error' || status === 'stalled') {
+            rightButtons += mobile
+                ? `<button class="mobile-icon-btn icon-log" title="Log" aria-label="Log" onclick="openLog('${id}')">📄</button> `
+                : `<button onclick="openLog('${id}')">Log</button> `;
+        }
         if (status === 'downloading' || status === 'postprocessing') {
             rightButtons += `<button onclick="openLiveLog('${id}')">Live Log</button> `;
             rightButtons += `<button onclick="cancelItem('${id}')">Cancel</button>`;
         }
         if (status !== 'downloading' && status !== 'postprocessing') {
-            rightButtons += `<button onclick="removeEntry('${id}')">Remove</button>`;
+            rightButtons += mobile
+                ? `<button class="mobile-icon-btn icon-remove" title="Remove" aria-label="Remove" onclick="removeEntry('${id}')">✖</button>`
+                : `<button onclick="removeEntry('${id}')">Remove</button>`;
         }
         let progressHTML = '';
         let smallText = '';
+        let pctText = '';
+        let etaText = '';
         if (it.progress) {
-            const pct = it.progress.percent || 0;
+            const rawPct = Number(it.progress.percent || 0);
+            const pct = Number.isFinite(rawPct) ? Math.max(0, Math.min(100, rawPct)) : 0;
             progressHTML = `<div class="progress" style="flex:1;"><div class="fill" style="width:${pct}%"></div></div>`;
+            pctText = `${Math.round(pct)}%`;
+            etaText = it.progress.eta ? `ETA: ${it.progress.eta}` : '';
         }
         if (it.error && it.last_output) {
             smallText = `<div class="small">${escapeHtml(truncateSingleLine(it.last_output, 120))}</div>`;
         } else if (it.progress && it.progress.status === 'postprocessing' && it.progress.detail) {
             // show current post-processing log line to indicate what is being worked on
             smallText = `<div class="small">${escapeHtml(truncateSingleLine(it.progress.detail, 120))}</div>`;
+        } else if (status === 'downloading' || status === 'postprocessing' || status === 'processing' || (it.progress && it.progress.status === 'waiting')) {
+            const progressLine = [status];
+            if (pctText) progressLine.push(pctText);
+            if (etaText) progressLine.push(etaText);
+            smallText = `<div class="small">${progressLine.join(' • ')}</div>`;
         } else {
-            smallText = `<div class="small">${status}${it.progress && it.progress.eta ? ' • ETA: ' + it.progress.eta : ''}</div>`;
+            smallText = `<div class="small">${status}</div>`;
         }
 
-        // check viewport width to identify mobile/desktop interface
-        let vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0)
-        if (vw > 600 || vw == 0) {
+        if (!mobile) {
             // desktop interface
             return `
           <div class="top-row">
@@ -1166,10 +1236,7 @@ INDEX_HTML = r"""
         stateCache = st;
         const itemsEl = document.getElementById('items');
         itemsEl.innerHTML = '';
-        const all = Array.isArray(st.queue) ? st.queue.slice() : [];
-
-        // allow items without added_at to appear later; default to 0
-        all.sort((a, b) => (b.added_at || 0) - (a.added_at || 0));
+        const all = sortQueueItems(Array.isArray(st.queue) ? st.queue : []);
 
         all.forEach(it => {
             const li = document.createElement('li');
@@ -1198,29 +1265,36 @@ INDEX_HTML = r"""
         prev.forEach(it => { if (it && it.id) prevMap[it.id] = it; });
 
         const now = Array.isArray(st.queue) ? st.queue : [];
-        now.forEach(it => {
-            const el = document.querySelector(`#items [data-id="${it.id}"]`);
-            if (el) {
+        const sortedNow = sortQueueItems(now);
+        const nowIds = new Set(sortedNow.map(it => it.id));
+        const itemsEl = document.getElementById('items');
+
+        // remove stale elements that no longer exist
+        const existingEls = Array.from(itemsEl.querySelectorAll('.item'));
+        existingEls.forEach(el => {
+            const id = el.getAttribute('data-id');
+            if (!nowIds.has(id)) el.remove();
+        });
+
+        // update content and then re-append in sorted order to preserve ordering across status changes
+        sortedNow.forEach(it => {
+            let li = itemsEl.querySelector(`[data-id="${it.id}"]`);
+            if (li) {
                 const prevIt = prevMap[it.id];
                 // shallow JSON compare (good enough for UI updates)
                 if (!prevIt || JSON.stringify(prevIt) !== JSON.stringify(it)) {
-                    el.innerHTML = buildItemHTML(it);
+                    const wasChecked = Boolean(li.querySelector('.sel')?.checked);
+                    li.innerHTML = buildItemHTML(it);
+                    const sel = li.querySelector('.sel');
+                    if (sel) sel.checked = wasChecked;
                 }
             } else {
-                const li = document.createElement('li');
+                li = document.createElement('li');
                 li.className = 'item';
                 li.setAttribute('data-id', it.id);
                 li.innerHTML = buildItemHTML(it);
-                const itemsEl = document.getElementById('items');
-                itemsEl.insertBefore(li, itemsEl.firstChild);
             }
-        });
-
-        // remove stale elements that no longer exist
-        const existingEls = Array.from(document.querySelectorAll('#items .item'));
-        existingEls.forEach(el => {
-            const id = el.getAttribute('data-id');
-            if (!now.find(x => x && x.id === id)) el.remove();
+            itemsEl.appendChild(li);
         });
 
         const c = countsFromState(st);
@@ -1570,17 +1644,15 @@ INDEX_HTML = r"""
     };
 
     document.getElementById('removeCompleted').onclick = () => {
-        openConfirmModal('Remove all completed?', async () => {
-            await fetch('/clear', {method: 'POST', headers: { "Content-Type": "application/json" }, body: ('{"statuses":["completed"]}') });
-            showToastStyled('Removed all completed');
-        });
+        fetch('/clear', {method: 'POST', headers: {"Content-Type": "application/json"}, body: ('{"statuses":["completed"]}') })
+            .then(() => showToastStyled('Removed all completed'))
+            .catch(() => showToastStyled('Failed to remove completed', 'error'));
     };
 
     document.getElementById('removeAllDupes').onclick = () => {
-        openConfirmModal('Remove all duplicates?', async () => {
-            await fetch('/clear', {method: 'POST', headers: { "Content-Type": "application/json" }, body: ('{"statuses":["duplicate"]}') });
-            showToastStyled('Removed all duplicates');
-        });
+        fetch('/clear', {method: 'POST', headers: {"Content-Type": "application/json"}, body: ('{"statuses":["duplicate"]}') })
+            .then(() => showToastStyled('Removed all duplicates'))
+            .catch(() => showToastStyled('Failed to remove duplicates', 'error'));
     };
 
 
