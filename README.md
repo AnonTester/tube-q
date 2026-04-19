@@ -118,9 +118,10 @@ Volumes:
  * /app/conf - stores configuration files and yt-dlp updated binary
  * /downloads - to save downloaded videos
 
-ffmpeg/ffprobe binaries from host system:
- * /usr/bin/ffmpeg:/usr/bin/ffmpeg
- * /usr/bin/ffprobe:/usr/bin/ffprobe
+`ffmpeg`/`ffprobe` are installed in the container image by default.
+Avoid bind-mounting single host binaries into `/usr/bin` because shared-library versions can mismatch.
+
+Optional binary override (advanced): mount a full compatible toolchain directory and point env vars to it.
 
 ```bash
 docker-compose up -d

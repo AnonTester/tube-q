@@ -20,8 +20,12 @@ services:
 
       # Optional: override binaries
       #- /usr/bin:/binaries:ro
-      - /usr/bin/ffmpeg:/usr/bin/ffmpeg
-      - /usr/bin/ffprobe:/usr/bin/ffprobe
+      # Avoid bind-mounting single host ffmpeg/ffprobe binaries into this Ubuntu image:
+      # the binary and shared-library versions can mismatch and fail at runtime.
+      # Use container-provided ffmpeg/ffprobe (installed via Dockerfile) by default.
+      #- /usr/bin/ffmpeg:/usr/bin/ffmpeg
+      #- /usr/bin/ffprobe:/usr/bin/ffprobe
+      # If bind-mounting ffmpeg/ffprobe binaries, use the static versions instead!
 
     environment:
       YT_DLP_BINARY: "/usr/bin/yt-dlp"
@@ -36,11 +40,11 @@ services:
       timeout: 10s
 
 
-# AMD/Intel GPUS:
+# AMD/Intel GPUs:
     devices:
       - /dev/dri:/dev/dri
 
-# NVIDIA GPUS:
+# NVIDIA GPUs:
 #    deploy:
 #      resources:
 #        reservations:

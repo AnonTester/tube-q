@@ -2,9 +2,10 @@
 """
 Tube-Q : yt-dlp Tube Download Queue
 """
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.11.0"
 
 import asyncio
+import copy
 import json
 import hashlib
 import re
@@ -37,6 +38,7 @@ FAVICON_DIR = CONF_DIR / "favicons"
 FAVICON_DIR.mkdir(exist_ok=True)
 LOGS_DIR = CONF_DIR / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
+URL_ATTEMPTS_LOG_PATH = LOGS_DIR / "url_attempts.log"
 
 YT_DLP_BINARY = "yt-dlp"
 
@@ -230,6 +232,20 @@ def save_all_state():
         pass
 
 
+def append_url_attempt(url: str, outcome: str, source: str = "api", uid: Optional[str] = None):
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    safe_url = (url or "").replace("\n", " ").strip()
+    safe_outcome = (outcome or "").replace("\n", " ").strip()
+    safe_source = (source or "").replace("\n", " ").strip()
+    safe_uid = uid or "-"
+    line = f"{ts}\t{safe_source}\t{safe_outcome}\t{safe_uid}\t{safe_url}\n"
+    try:
+        with URL_ATTEMPTS_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
 async def persist_and_publish():
     save_all_state()
     await publish_state()
@@ -298,10 +314,44 @@ def check_latest_ytdlp_version_once_daily():
         return CONFIG.get("yt_dlp_latest")
 
 
+def _parse_version_parts(version: Optional[str]) -> Optional[tuple]:
+    if version is None:
+        return None
+    raw = str(version).strip()
+    if not raw or raw.lower() == "unknown":
+        return None
+    nums = re.findall(r"\d+", raw)
+    if not nums:
+        return None
+    try:
+        return tuple(int(n) for n in nums)
+    except Exception:
+        return None
+
+
+def is_update_available(local_version: Optional[str], latest_version: Optional[str]) -> bool:
+    local_raw = (local_version or "").strip()
+    latest_raw = (latest_version or "").strip()
+    if not local_raw or local_raw.lower() == "unknown" or not latest_raw:
+        return False
+    if local_raw == latest_raw:
+        return False
+
+    local_parts = _parse_version_parts(local_raw)
+    latest_parts = _parse_version_parts(latest_raw)
+    if local_parts is not None and latest_parts is not None:
+        length = max(len(local_parts), len(latest_parts))
+        local_norm = local_parts + (0,) * (length - len(local_parts))
+        latest_norm = latest_parts + (0,) * (length - len(latest_parts))
+        return latest_norm > local_norm
+
+    # Fallback for non-standard version strings.
+    return latest_raw != local_raw
+
+
 LOCAL_YTDLP_VERSION = get_local_ytdlp_version()
 LATEST_YTDLP_VERSION = check_latest_ytdlp_version_once_daily()
-UPDATE_AVAILABLE = (
-            LATEST_YTDLP_VERSION and LOCAL_YTDLP_VERSION != "unknown" and LATEST_YTDLP_VERSION != LOCAL_YTDLP_VERSION)
+UPDATE_AVAILABLE = is_update_available(LOCAL_YTDLP_VERSION, LATEST_YTDLP_VERSION)
 
 
 # === yt-dlp runner with logging ===
@@ -1485,7 +1535,7 @@ INDEX_HTML = r"""
         document.getElementById('currentVerText').innerText = localVer;
         document.getElementById('latestVerText').innerText = latestVer;
         // render update link area if needed
-        renderUpdateArea(Boolean(latestVer && (localVer !== latestVer)), latestVer);
+        renderUpdateArea(Boolean(j.update_available), latestVer);
     });
 
     function renderUpdateArea(available, latest) {
@@ -2125,6 +2175,11 @@ async def index():
     return INDEX_HTML_PATH.read_text()
 
 
+@app.head("/", include_in_schema=False)
+async def index_head():
+    return PlainTextResponse("", status_code=200)
+
+
 @app.get("/favicon.ico")
 async def app_favicon():
     return FileResponse("favicon.ico")
@@ -2374,12 +2429,14 @@ async def add_urls(request: Request, paused: Optional[bool] = Query(False)):
         # if in queue, ignore
         if any(item.get('url') == url for item in QUEUE_STATE.values()):
             duplicates += 1
+            append_url_attempt(url, "duplicate_in_queue", uid=uid)
             continue
         # if in history, add as duplicate for option to redownload it
         if url in HISTORY:
             duplicates += 1
             # do not await favicon fetch here (fast return). set placeholder; fetch async
             QUEUE_STATE[uid] = {"id": uid, "url": url, "favicon": "_generic.ico", "status": "duplicate", "added_at": int(time.time())}
+            append_url_attempt(url, "duplicate_in_history", uid=uid)
             # spawn favicon fetch in background
             if DOWNLOAD_FAVICONS:
                 asyncio.create_task(_bg_fetch_favicon_and_update(uid, url, 'duplicates'))
@@ -2388,6 +2445,7 @@ async def add_urls(request: Request, paused: Optional[bool] = Query(False)):
         item = {"id": uid, "url": url, "domain": get_domain(url), 'favicon': "_generic.ico",
                 "added_at": int(time.time()), "paused": bool(paused or NEW_URLS_PAUSED), "processing": False, "status": "queued",}
         QUEUE_STATE[uid] = item
+        append_url_attempt(url, "queued_paused" if item.get("paused") else "queued", uid=uid)
         # spawn favicon fetch in background without blocking response
         if DOWNLOAD_FAVICONS:
             asyncio.create_task(_bg_fetch_favicon_and_update(uid, url, 'queue'))
@@ -2571,8 +2629,15 @@ async def dump_duplicates():
 
 @app.get('/version')
 async def version():
-    return JSONResponse({'yt_dlp_version': get_yt_dlp_version(), 'app_version': APP_VERSION,
-                         'latest_ytdlp': CONFIG.get('yt_dlp_latest'), 'update_available': UPDATE_AVAILABLE})
+    global LOCAL_YTDLP_VERSION, LATEST_YTDLP_VERSION, UPDATE_AVAILABLE
+    local_version = get_yt_dlp_version()
+    latest_version = check_latest_ytdlp_version_once_daily()
+    LOCAL_YTDLP_VERSION = local_version
+    LATEST_YTDLP_VERSION = latest_version
+    UPDATE_AVAILABLE = is_update_available(local_version, latest_version)
+    return JSONResponse({'yt_dlp_version': local_version, 'app_version': APP_VERSION,
+                         'latest_ytdlp': latest_version,
+                         'update_available': UPDATE_AVAILABLE})
 
 
 @app.get('/health')
@@ -2627,8 +2692,7 @@ async def update_ytdlp():
         YT_DLP_PATH = Path(CONFIG['yt_dlp_path'])
         LOCAL_YTDLP_VERSION = get_local_ytdlp_version()
         LATEST_YTDLP_VERSION = check_latest_ytdlp_version_once_daily()
-        UPDATE_AVAILABLE = (
-                    LATEST_YTDLP_VERSION and LOCAL_YTDLP_VERSION != "unknown" and LATEST_YTDLP_VERSION != LOCAL_YTDLP_VERSION)
+        UPDATE_AVAILABLE = is_update_available(LOCAL_YTDLP_VERSION, LATEST_YTDLP_VERSION)
 
         await publish_state()
         return JSONResponse({'status': 'success', 'version': LATEST_YTDLP_VERSION})
@@ -2648,17 +2712,33 @@ def cli_add_mode(arg_text: str):
     if not urls:
         print('no urls')
         return
-    q = json.loads(QUEUE_PATH.read_text())
-    h = json.loads(HISTORY_PATH.read_text())
+    try:
+        q = json.loads(QUEUE_PATH.read_text())
+        if not isinstance(q, dict):
+            q = {}
+    except Exception:
+        q = {}
+    try:
+        h = json.loads(HISTORY_PATH.read_text())
+        if not isinstance(h, list):
+            h = []
+    except Exception:
+        h = []
     added = 0
     for url in urls:
-        if url in h or any(x['url'] == url for x in q):
-            print('duplicate:', url)
-            continue
         uid = make_id(url)
-        q.append(
+        if any((it or {}).get("url") == url for it in q.values()):
+            print('duplicate:', url)
+            append_url_attempt(url, "duplicate_in_queue", source="cli", uid=uid)
+            continue
+        if url in h:
+            print('duplicate:', url)
+            append_url_attempt(url, "duplicate_in_history", source="cli", uid=uid)
+            continue
+        q[uid] = (
             {'id': uid, 'url': url, 'domain': get_domain(url), 'added_at': int(time.time()), 'paused': NEW_URLS_PAUSED,
              'processing': False, 'favicon': '_generic.ico'})
+        append_url_attempt(url, "queued_paused" if NEW_URLS_PAUSED else "queued", source="cli", uid=uid)
         added += 1
     QUEUE_PATH.write_text(json.dumps(q, indent=2))
     print('added', added)
@@ -2674,7 +2754,15 @@ if __name__ == '__main__':
         cli_add_mode(args.add)
         sys.exit(0)
     import uvicorn
+    from uvicorn.config import LOGGING_CONFIG
+
+    log_config = copy.deepcopy(LOGGING_CONFIG)
+    log_config["formatters"]["default"]["fmt"] = "%(asctime)s %(levelprefix)s %(message)s"
+    log_config["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    log_config["formatters"]["access"]["fmt"] = '%(asctime)s %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    log_config["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+
     print(f"-=-=-=-=-=-=-=-=-=-=-=")
     print(f"Tube-Q v{APP_VERSION}")
     print(f"-=-=-=-=-=-=-=-=-=-=-=")
-    uvicorn.run(app, host='0.0.0.0', port=int(CONFIG.get('port', 7090)))
+    uvicorn.run(app, host='0.0.0.0', port=int(CONFIG.get('port', 7090)), log_config=log_config)
