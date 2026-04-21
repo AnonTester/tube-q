@@ -2,7 +2,7 @@
 """
 Tube-Q : yt-dlp Tube Download Queue
 """
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.12.1"
 
 import asyncio
 import copy
@@ -1359,6 +1359,8 @@ INDEX_HTML = r"""
         document.getElementById('cnt-duplicates').innerText = c.duplicates;
 
         updateTabsVisibility(c);
+        // Re-apply active-tab filtering whenever statuses change.
+        filterView();
         attachSelectionHandlers();
     }
 
@@ -1409,10 +1411,12 @@ INDEX_HTML = r"""
         document.getElementById('cnt-errors').innerText = c.errors;
         document.getElementById('cnt-duplicates').innerText = c.duplicates;
 
-        updateTabsVisibility(c);
-        attachSelectionHandlers();
-
+        // Ensure filter/selection logic uses the newest queue state.
         stateCache = st;
+        updateTabsVisibility(c);
+        // Re-apply active-tab filtering whenever statuses change.
+        filterView();
+        attachSelectionHandlers();
     }
 
     function handleState(st) {
