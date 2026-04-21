@@ -2,7 +2,7 @@
 """
 Tube-Q : yt-dlp Tube Download Queue
 """
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.12.0"
 
 import asyncio
 import copy
@@ -20,7 +20,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 
 import aiohttp
 from fastapi import FastAPI, Request, HTTPException, Query
@@ -44,7 +44,8 @@ YT_DLP_BINARY = "yt-dlp"
 
 DEFAULT_CONFIG = {
     "port": 7090,
-    "concurrent_downloads": 2,
+    "concurrent_downloads_global": 10,
+    "concurrent_downloads_per_domain": 2,
     "yt_dlp_path": str(CONF_DIR / "yt-dlp"),  # alternative binary path (if present)
     "queue_file": str(CONF_DIR / "queue.json"),
     "history_file": str(CONF_DIR / "history.json"),
@@ -63,13 +64,26 @@ if not CONFIG_PATH.exists():
     CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2))
 CONFIG = json.loads(CONFIG_PATH.read_text())
 
+
+def _to_pos_int(value: Any, fallback: int) -> int:
+    try:
+        n = int(value)
+    except Exception:
+        n = int(fallback)
+    return n if n >= 1 else int(fallback if int(fallback) >= 1 else 1)
+
+
 # load some runtime vars from config
 QUEUE_PATH = Path(CONFIG.get("queue_file"))
 HISTORY_PATH = Path(CONFIG.get("history_file"))
 # unified queue state file (single JSON map: id -> item)
 YT_DLP_PATH = Path(CONFIG.get("yt_dlp_path", str(CONF_DIR / "yt-dlp")))
 YT_DLP_GLOBAL_ARGS = CONFIG.get("yt_dlp_global_args", []) or []
-CONCURRENT_DOWNLOADS = int(CONFIG.get("concurrent_downloads", 2))
+CONCURRENT_DOWNLOADS_GLOBAL = _to_pos_int(
+    CONFIG.get("concurrent_downloads_global", CONFIG.get("concurrent_downloads", 10)),
+    10
+)
+CONCURRENT_DOWNLOADS_PER_DOMAIN = _to_pos_int(CONFIG.get("concurrent_downloads_per_domain", 2), 2)
 START_PAUSED = bool(CONFIG.get("start_paused", False))
 NEW_URLS_PAUSED = bool(CONFIG.get("new_urls_paused", False))
 DOWNLOAD_FAVICONS = bool(CONFIG.get("download_favicons", True))
@@ -161,8 +175,13 @@ DOWNLOADS: Dict[str, Dict[str, Any]] = {}
 
 # detect stalled items from previous crash or restart
 for item in QUEUE_STATE.values():
-    if item.get("status") in ("downloading", "processing", "postprocessing"):
+    status = item.get("status")
+    if status in ("downloading", "postprocessing"):
         item["status"] = "stalled"
+    elif status == "processing":
+        # Legacy transient status: keep it queued.
+        item["status"] = "queued"
+    item.pop("processing", None)
 #save_all_state()
 
 pause_all_flag = START_PAUSED
@@ -527,35 +546,70 @@ async def run_yt_dlp_for_item(item: Dict[str, Any]):
 
 # === queue processor ===
 async def queue_processor():
-    sem = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
+    active_global = 0
+    active_by_domain: Dict[str, int] = {}
+    scheduled_ids: Set[str] = set()
+
+    def domain_key_for_item(item: Dict[str, Any]) -> str:
+        domain = (item or {}).get("domain") or get_domain((item or {}).get("url", "")) or "_unknown"
+        return str(domain).lower()
+
     while True:
         if pause_all_flag:
             await asyncio.sleep(0.5)
             continue
-        # pick next queued item (not paused) from unified QUEUE_STATE
+
+        if active_global >= CONCURRENT_DOWNLOADS_GLOBAL:
+            await asyncio.sleep(0.2)
+            continue
+
+        # pick next queued item (not paused), constrained by per-domain concurrency
         next_item = None
+        next_domain = None
         for it in list(QUEUE_STATE.values()):
+            item_id = it.get("id")
+            if not item_id or item_id in scheduled_ids:
+                continue
             if it.get("status") in (None, "queued") and not it.get("paused", False):
+                domain = domain_key_for_item(it)
+                if active_by_domain.get(domain, 0) >= CONCURRENT_DOWNLOADS_PER_DOMAIN:
+                    continue
                 next_item = it
+                next_domain = domain
                 break
+
         if not next_item:
             await asyncio.sleep(0.4)
             continue
-        next_item["status"] = "processing"
-        # persist selection
-        QUEUE_STATE[next_item["id"]] = next_item
-        save_all_state()
-        await sem.acquire()
 
-        async def run_and_release(item):
+        item_id = next_item.get("id")
+        if not item_id or not next_domain:
+            await asyncio.sleep(0.1)
+            continue
+
+        scheduled_ids.add(item_id)
+        active_global += 1
+        active_by_domain[next_domain] = active_by_domain.get(next_domain, 0) + 1
+
+        async def run_and_release(item: Dict[str, Any], domain: str):
+            nonlocal active_global
             try:
-                await run_yt_dlp_for_item(item)
+                current = QUEUE_STATE.get(item.get("id"))
+                if current and current.get("status") in (None, "queued") and not current.get("paused", False):
+                    await run_yt_dlp_for_item(current)
                 # do not remove from QUEUE_STATE — state remains for history / UI; entry kept with final status
             finally:
-                sem.release()
+                if item.get("id"):
+                    scheduled_ids.discard(item.get("id"))
+                active_global = max(0, active_global - 1)
+                left = active_by_domain.get(domain, 0) - 1
+                if left <= 0:
+                    active_by_domain.pop(domain, None)
+                else:
+                    active_by_domain[domain] = left
 
-        asyncio.create_task(run_and_release(next_item))
-        await asyncio.sleep(0.1)
+        asyncio.create_task(run_and_release(next_item, next_domain))
+        await asyncio.sleep(0.05)
 
 
 # === version retrieval (used in SSE payload) ===
@@ -1129,7 +1183,7 @@ INDEX_HTML = r"""
 
     function itemStatus(it) {
         if (!it) return 'queued';
-        if (it.status) return it.status; // prefer explicit server-side status field
+        if (it.status) return it.status === 'processing' ? 'queued' : it.status; // map legacy transient status
         if (it.error) return 'error';
         if (it.progress || it.in_downloads) return (it.progress && it.progress.status === 'postprocessing') ? 'postprocessing' : 'downloading';
         if (it.completed_at) return 'completed';
@@ -1145,7 +1199,7 @@ INDEX_HTML = r"""
     }
 
     function statusSortRank(status) {
-        if (status === 'downloading' || status === 'postprocessing' || status === 'processing' || status === 'waiting') return 0;
+        if (status === 'downloading' || status === 'postprocessing' || status === 'waiting') return 0;
         if (status === 'queued' || status === 'paused') return 1;
         if (status === 'error' || status === 'stalled' || status === 'cancelled') return 2;
         if (status === 'duplicate') return 3;
@@ -1229,7 +1283,7 @@ INDEX_HTML = r"""
         } else if (it.progress && it.progress.status === 'postprocessing' && it.progress.detail) {
             // show current post-processing log line to indicate what is being worked on
             smallText = `<div class="small">${escapeHtml(truncateSingleLine(it.progress.detail, 120))}</div>`;
-        } else if (status === 'downloading' || status === 'postprocessing' || status === 'processing' || (it.progress && it.progress.status === 'waiting')) {
+        } else if (status === 'downloading' || status === 'postprocessing' || (it.progress && it.progress.status === 'waiting')) {
             const progressLine = [status];
             if (pctText) progressLine.push(pctText);
             if (etaText) progressLine.push(etaText);
@@ -1894,7 +1948,8 @@ INDEX_HTML = r"""
         // show fields with nice labels and merged yt-dlp path+binary
         const fields = [
             {key: 'port', label: 'Web UI Port (1–65535)'},
-            {key: 'concurrent_downloads', label: 'Concurrent Downloads (>=1)'},
+            {key: 'concurrent_downloads_global', label: 'Concurrent Downloads Global (>=1)'},
+            {key: 'concurrent_downloads_per_domain', label: 'Concurrent Downloads Per Domain (>=1)'},
             {key: 'yt_dlp_path', label: 'yt-dlp Path (includes binary)'},
             {key: 'yt_dlp_global_args', label: 'yt-dlp Global Arguments'},
             {key: 'start_paused', label: 'Start paused'},
@@ -2040,13 +2095,13 @@ INDEX_HTML = r"""
     saveSettingsBtn.onclick = async () => {
         // gather general
         const newCfg = {};
-        const fields = ['port', 'concurrent_downloads', 'yt_dlp_global_args', 'start_paused', 'new_urls_paused', 'download_favicons', 'yt_dlp_path'];
+        const fields = ['port', 'concurrent_downloads_global', 'concurrent_downloads_per_domain', 'yt_dlp_global_args', 'start_paused', 'new_urls_paused', 'download_favicons', 'yt_dlp_path'];
         fields.forEach(f => {
             const el = document.getElementById('cfg_' + f);
             if (!el) return;
             if (el.type === 'checkbox') newCfg[f] = el.checked;
             else if (el.tagName.toLowerCase() === 'textarea') newCfg[f] = el.value.split('\n').map(s => s.trim()).filter(Boolean);
-            else if (f === 'port' || f === 'concurrent_downloads') newCfg[f] = parseInt(el.value, 10) || 0;
+            else if (f === 'port' || f === 'concurrent_downloads_global' || f === 'concurrent_downloads_per_domain') newCfg[f] = parseInt(el.value, 10) || 0;
             else newCfg[f] = el.value;
         });
 
@@ -2111,14 +2166,21 @@ INDEX_HTML = r"""
     // hamburger menu toggling
     const hamBtn = document.getElementById('hamburgerBtn');
     const hamMenu = document.getElementById('hamburgerMenu');
+    const closeHamburgerMenu = () => {
+        if (hamMenu) hamMenu.style.display = 'none';
+    };
     if (hamBtn) {
         hamBtn.addEventListener('click', () => {
             hamMenu.style.display = hamMenu.style.display === 'flex' ? 'none' : 'flex';
         });
+        // close menu once any action button is chosen (helps mobile/touch interaction)
+        hamMenu.addEventListener('click', (e) => {
+            if (e.target && e.target.tagName === 'BUTTON') closeHamburgerMenu();
+        });
         // close if clicked outside
         document.addEventListener('click', (e) => {
             if (!hamBtn.contains(e.target) && !hamMenu.contains(e.target)) {
-                hamMenu.style.display = 'none';
+                closeHamburgerMenu();
             }
         });
     }
@@ -2356,6 +2418,12 @@ async def retry_all_dupes():
 async def get_settings():
     """Return full settings, including contents of default.conf if present."""
     data = CONFIG.copy()
+    # normalize concurrency keys for UI/backward-compat
+    data['concurrent_downloads_global'] = _to_pos_int(
+        data.get('concurrent_downloads_global', data.get('concurrent_downloads', 10)),
+        10
+    )
+    data['concurrent_downloads_per_domain'] = _to_pos_int(data.get('concurrent_downloads_per_domain', 2), 2)
     try:
         default_conf_path = YTDLP_CONFIG_FOLDER / "default.conf"
         if default_conf_path.exists():
@@ -2379,6 +2447,13 @@ async def save_settings(body: Dict[str, Any]):
     # apply general
     for k, v in gen.items():
         raw[k] = v
+    raw['concurrent_downloads_global'] = _to_pos_int(
+        raw.get('concurrent_downloads_global', raw.get('concurrent_downloads', 10)),
+        10
+    )
+    raw['concurrent_downloads_per_domain'] = _to_pos_int(raw.get('concurrent_downloads_per_domain', 2), 2)
+    # keep legacy key in sync for older installations/tools
+    raw['concurrent_downloads'] = raw['concurrent_downloads_global']
     # apply domain overrides only if provided (do not wipe existing if not provided)
     # doms will be {} if client explicitly sent an empty map; that's expected.
     if 'domain_overrides' in body:
@@ -2400,9 +2475,16 @@ async def save_settings(body: Dict[str, Any]):
         # persist full config JSON
         CONFIG_PATH.write_text(json.dumps(raw, indent=2))
         # update runtime vars
-        global YT_DLP_BINARY, YT_DLP_GLOBAL_ARGS, CONCURRENT_DOWNLOADS, START_PAUSED, NEW_URLS_PAUSED, DOWNLOAD_FAVICONS, DOMAIN_OVERRIDES, YT_DLP_PATH, CONFIG
+        global YT_DLP_BINARY, YT_DLP_GLOBAL_ARGS, CONCURRENT_DOWNLOADS_GLOBAL, CONCURRENT_DOWNLOADS_PER_DOMAIN, START_PAUSED, NEW_URLS_PAUSED, DOWNLOAD_FAVICONS, DOMAIN_OVERRIDES, YT_DLP_PATH, CONFIG
         YT_DLP_GLOBAL_ARGS = raw.get('yt_dlp_global_args', YT_DLP_GLOBAL_ARGS) or []
-        CONCURRENT_DOWNLOADS = int(raw.get('concurrent_downloads', CONCURRENT_DOWNLOADS))
+        CONCURRENT_DOWNLOADS_GLOBAL = _to_pos_int(
+            raw.get('concurrent_downloads_global', raw.get('concurrent_downloads', CONCURRENT_DOWNLOADS_GLOBAL)),
+            CONCURRENT_DOWNLOADS_GLOBAL
+        )
+        CONCURRENT_DOWNLOADS_PER_DOMAIN = _to_pos_int(
+            raw.get('concurrent_downloads_per_domain', CONCURRENT_DOWNLOADS_PER_DOMAIN),
+            CONCURRENT_DOWNLOADS_PER_DOMAIN
+        )
         START_PAUSED = bool(raw.get('start_paused', START_PAUSED))
         NEW_URLS_PAUSED = bool(raw.get('new_urls_paused', NEW_URLS_PAUSED))
         DOWNLOAD_FAVICONS = bool(raw.get('download_favicons', DOWNLOAD_FAVICONS))
@@ -2443,7 +2525,7 @@ async def add_urls(request: Request, paused: Optional[bool] = Query(False)):
             continue
         # new item: add to regular queue, placeholder favicon for immediate response
         item = {"id": uid, "url": url, "domain": get_domain(url), 'favicon': "_generic.ico",
-                "added_at": int(time.time()), "paused": bool(paused or NEW_URLS_PAUSED), "processing": False, "status": "queued",}
+                "added_at": int(time.time()), "paused": bool(paused or NEW_URLS_PAUSED), "status": "queued",}
         QUEUE_STATE[uid] = item
         append_url_attempt(url, "queued_paused" if item.get("paused") else "queued", uid=uid)
         # spawn favicon fetch in background without blocking response
@@ -2737,7 +2819,7 @@ def cli_add_mode(arg_text: str):
             continue
         q[uid] = (
             {'id': uid, 'url': url, 'domain': get_domain(url), 'added_at': int(time.time()), 'paused': NEW_URLS_PAUSED,
-             'processing': False, 'favicon': '_generic.ico'})
+             'favicon': '_generic.ico'})
         append_url_attempt(url, "queued_paused" if NEW_URLS_PAUSED else "queued", source="cli", uid=uid)
         added += 1
     QUEUE_PATH.write_text(json.dumps(q, indent=2))

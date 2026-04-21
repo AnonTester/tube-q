@@ -22,6 +22,7 @@ Main features:
 - Real-time progress updates (speed, ETA, percentage)
 - Pause, resume, or retry failed downloads
 - Auto-save queue and history
+- Separate global and per-domain concurrency limits (defaults: global `10`, per-domain `2`)
 - Supports domain-specific settings
 - Check for new yt-dlp version and update function
 - Easy browser integration (send current page or link to Tube-Q)
@@ -158,8 +159,9 @@ Example Tube-Q defaults:
 ```yaml
 {
   "port": 7090,
-  "concurrent_downloads": 2,
-  "yt_dlp_binary": "yt-dlp",
+  "concurrent_downloads_global": 10,
+  "concurrent_downloads_per_domain": 2,
+  "yt_dlp_path": "conf/yt-dlp",
   "yt_dlp_global_args": [],
   "start_paused": false,
   "new_urls_paused": false,
