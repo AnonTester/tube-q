@@ -2,7 +2,7 @@
 """
 Tube-Q : yt-dlp Tube Download Queue
 """
-APP_VERSION = "1.12.1"
+APP_VERSION = "1.13.0"
 
 import asyncio
 import copy
@@ -595,7 +595,7 @@ async def queue_processor():
             nonlocal active_global
             try:
                 current = QUEUE_STATE.get(item.get("id"))
-                if current and current.get("status") in (None, "queued") and not current.get("paused", False):
+                if current and current.get("status") in (None, "queued") and not current.get("paused", False) and not pause_all_flag:
                     await run_yt_dlp_for_item(current)
                 # do not remove from QUEUE_STATE — state remains for history / UI; entry kept with final status
             finally:
@@ -630,7 +630,8 @@ async def publish_state():
         queue_list = []
 
     payload = {
-        "queue": queue_list
+        "queue": queue_list,
+        "pause_all": pause_all_flag
     }
     data = json.dumps(payload)
     for q in list(subscribers):
@@ -752,10 +753,15 @@ INDEX_HTML = r"""
     .bulk-bar{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
     .top-right-controls{margin-left:auto;display:flex;gap:8px}
     .hidden{display:none !important}
+    /* queue action buttons on the right side of tabs */
+    .queue-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+    .queue-toggle-btn { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 6px 10px; font-size: 1.05rem; line-height: 1; min-width: 38px; }
+    .queue-toggle-btn.state-paused { background: #16a34a; }
+    .queue-toggle-btn:disabled { opacity: 0.7; cursor: wait; }
     /* hamburger menu dropdown for queue actions */
-    .hamburger-container { position: relative; margin-left: auto; }
+    .hamburger-container { position: relative; }
     .hamburger-btn { background: var(--accent); color: white; border: none; border-radius: 6px; padding: 6px 10px; font-size: 1.2rem; cursor: pointer; }
-    .hamburger-menu { position: absolute; right: 0; top: 100%; background: var(--card); box-shadow: 0 4px 12px rgba(0,0,0,0.2); border-radius: 8px; display: none; flex-direction: column; min-width: 180px; z-index: 999; }
+    .hamburger-menu { position: absolute; right: 0; top: 100%; background: var(--card); box-shadow: 0 4px 12px rgba(0,0,0,0.2); border-radius: 8px; border: 1px solid; display: none; flex-direction: column; min-width: 180px; z-index: 999; }
     .hamburger-menu button { background: none; border: none; text-align: left; padding: 8px 12px; width: 100%; color: var(--fg); cursor: pointer; }
     .hamburger-menu button:hover { background: rgba(0,0,0,0.25); }
 
@@ -937,16 +943,19 @@ INDEX_HTML = r"""
             <div class="tab hidden" data-tab="errors">Errors <span class="pill" id="cnt-errors">0</span></div>
             <div class="tab hidden" data-tab="duplicates">Duplicates <span class="pill" id="cnt-duplicates">0</span>
             </div>
-            <div class="hamburger-container hidden" id="hamburgerContainer">
-                <button class="hamburger-btn" id="hamburgerBtn">&equiv;</button>
-                <div class="hamburger-menu" id="hamburgerMenu">
-                    <button id="removeCompleted">Remove Completed</button>
-                    <button id="copyErrors">Copy all Errors</button>
-                    <button id="copyDupes">Copy all Duplicates</button>
-                    <button id="removeAllErrors">Remove all Errors</button>
-                    <button id="removeAllDupes">Remove all Duplicates</button>
-                    <button id="retryAllErrors">Retry all Errors</button>
-                    <button id="retryAllDupes">Re-download all Duplicates</button>
+            <div class="queue-actions">
+                <button id="pauseAllToggle" class="queue-toggle-btn" title="Pause queue" aria-label="Pause queue">&#9208;</button>
+                <div class="hamburger-container hidden" id="hamburgerContainer">
+                    <button class="hamburger-btn" id="hamburgerBtn">&equiv;</button>
+                    <div class="hamburger-menu" id="hamburgerMenu">
+                        <button id="removeCompleted">Remove Completed</button>
+                        <button id="copyErrors">Copy all Errors</button>
+                        <button id="copyDupes">Copy all Duplicates</button>
+                        <button id="removeAllErrors">Remove all Errors</button>
+                        <button id="removeAllDupes">Remove all Duplicates</button>
+                        <button id="retryAllErrors">Retry all Errors</button>
+                        <button id="retryAllDupes">Re-download all Duplicates</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1046,6 +1055,52 @@ INDEX_HTML = r"""
     let reconnectTimer = null;
     let currentTab = 'all';
     let stateCache = { queue: [] };
+    let pauseAllCache = false;
+    let pauseAllPending = false;
+
+    function setPauseAllButton(paused) {
+        pauseAllCache = !!paused;
+        const btn = document.getElementById('pauseAllToggle');
+        if (!btn) return;
+        if (pauseAllCache) {
+            btn.innerHTML = '&#9658;';
+            btn.title = 'Resume queue';
+            btn.setAttribute('aria-label', 'Resume queue');
+            btn.classList.add('state-paused');
+        } else {
+            btn.innerHTML = '&#9208;';
+            btn.title = 'Pause queue';
+            btn.setAttribute('aria-label', 'Pause queue');
+            btn.classList.remove('state-paused');
+        }
+    }
+
+    async function togglePauseAll() {
+        if (pauseAllPending) return;
+        const btn = document.getElementById('pauseAllToggle');
+        const previous = pauseAllCache;
+        const target = !previous;
+        pauseAllPending = true;
+        if (btn) btn.disabled = true;
+        setPauseAllButton(target);
+        try {
+            const r = await fetch('/pause_all', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({paused: target})
+            });
+            if (!r.ok) throw new Error('request failed');
+            const j = await r.json();
+            setPauseAllButton(!!j.pause_all);
+            showToastStyled(j.pause_all ? 'Queue paused (running downloads continue)' : 'Queue resumed');
+        } catch (e) {
+            setPauseAllButton(previous);
+            showToastStyled('Failed to update pause-all state', 'error');
+        } finally {
+            pauseAllPending = false;
+            if (btn) btn.disabled = false;
+        }
+    }
 
     function attachSSE() {
         if (sse) {
@@ -1420,6 +1475,7 @@ INDEX_HTML = r"""
     }
 
     function handleState(st) {
+        if (st && typeof st.pause_all !== 'undefined') setPauseAllButton(!!st.pause_all);
         if (!stateCache) {
             fullRender(st);
             stateCache = st;
@@ -1534,6 +1590,8 @@ INDEX_HTML = r"""
     document.getElementById('selAll')?.addEventListener('click', selectAllVisible);
     document.getElementById('selInvert')?.addEventListener('click', invertSelection);
     document.getElementById('selNone')?.addEventListener('click', selectNone);
+    document.getElementById('pauseAllToggle')?.addEventListener('click', togglePauseAll);
+    setPauseAllButton(false);
 
     function updateHamburgerMenu(counts){
         const hamCont = document.getElementById('hamburgerContainer');
@@ -2266,7 +2324,20 @@ def status():
     return {
         "in_docker": is_docker(),
         "update_available": UPDATE_AVAILABLE,
+        "pause_all": pause_all_flag,
     }
+
+
+@app.post('/pause_all', response_class=JSONResponse)
+async def set_pause_all(body: Optional[Dict[str, Any]] = None):
+    global pause_all_flag
+    body = body or {}
+    if "paused" in body:
+        pause_all_flag = bool(body.get("paused"))
+    else:
+        pause_all_flag = not pause_all_flag
+    await publish_state()
+    return {"pause_all": pause_all_flag}
 
 
 @app.get("/events")
@@ -2276,7 +2347,8 @@ async def events():
 
     # immediately send initial state on connect
     initial_state = json.dumps({
-        "queue": list(QUEUE_STATE.values())
+        "queue": list(QUEUE_STATE.values()),
+        "pause_all": pause_all_flag
     })
 
     async def event_generator():
