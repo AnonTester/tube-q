@@ -2,7 +2,7 @@
 """
 Tube-Q : yt-dlp Tube Download Queue
 """
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.14.0"
 
 import asyncio
 import copy
@@ -390,6 +390,44 @@ async def run_yt_dlp_for_item(item: Dict[str, Any]):
     await persist_and_publish()
 
     enforced_wait_logged = False
+    last_progress_emit_ts = 0.0
+    last_progress_emit_status = ""
+    last_progress_emit_pct = 0.0
+    last_progress_emit_detail = ""
+
+    async def maybe_publish_progress(force: bool = False):
+        nonlocal last_progress_emit_ts, last_progress_emit_status, last_progress_emit_pct, last_progress_emit_detail
+        # Always keep in-memory state current so full snapshots remain accurate.
+        try:
+            DOWNLOADS[id_]["progress"] = progress
+        except Exception:
+            DOWNLOADS[id_] = {"item": item, "progress": progress, "process": None}
+        QUEUE_STATE.get(id_, {}).update({"progress": progress})
+
+        now = time.monotonic()
+        status_now = str(progress.get("status") or "")
+        pct_now = float(progress.get("percent") or 0.0)
+        detail_now = str(progress.get("detail") or "")
+
+        should_emit = force
+        if not should_emit and status_now != last_progress_emit_status:
+            should_emit = True
+        if not should_emit and abs(pct_now - last_progress_emit_pct) >= 1.0:
+            should_emit = True
+        if not should_emit and (now - last_progress_emit_ts) >= 0.75:
+            should_emit = True
+        if not should_emit and status_now == "postprocessing" and detail_now != last_progress_emit_detail and (
+                now - last_progress_emit_ts) >= 1.5:
+            should_emit = True
+
+        if not should_emit:
+            return
+
+        last_progress_emit_ts = now
+        last_progress_emit_status = status_now
+        last_progress_emit_pct = pct_now
+        last_progress_emit_detail = detail_now
+        await publish_item_update(id_, progress=progress)
 
     with log_path.open("ab") as lf:
 
@@ -464,7 +502,7 @@ async def run_yt_dlp_for_item(item: Dict[str, Any]):
                     if not enforced_wait_logged:
                         lf.write(b"[info] Enforced waiting detected\n")
                         enforced_wait_logged = True
-                    await publish_state()
+                    await maybe_publish_progress()
                     continue
 
                 # parse download progress lines
@@ -487,23 +525,20 @@ async def run_yt_dlp_for_item(item: Dict[str, Any]):
 
                     progress["status"] = "downloading"
                     progress["detail"] = line
-                    # reflect progress in DOWNLOADS and unified queue state
-                    DOWNLOADS[id_]["progress"] = progress
-                    QUEUE_STATE.get(id_, {}).update({"progress": progress})
-                    await publish_state()
+                    await maybe_publish_progress()
                     continue
 
                 # detect postprocessing phase
                 if any(ind in line for ind in POSTPROC_INDICATORS):
                     progress["status"] = "postprocessing"
                     progress["detail"] = line
-                    await publish_state()
+                    await maybe_publish_progress()
                     continue
 
         except Exception as e:
             progress["status"] = "error"
             progress["detail"] = f"progress parser error: {e}"
-            await publish_state()
+            await maybe_publish_progress(force=True)
 
         rc = await proc.wait()
         # cleanup running record
@@ -623,6 +658,15 @@ def get_yt_dlp_version() -> str:
 
 
 # === SSE publishing ===
+async def _publish_json_payload(payload: Dict[str, Any]):
+    data = json.dumps(payload)
+    for q in list(subscribers):
+        try:
+            await q.put(data)
+        except Exception:
+            pass
+
+
 async def publish_state():
     try:
         queue_list = list(QUEUE_STATE.values())
@@ -633,12 +677,14 @@ async def publish_state():
         "queue": queue_list,
         "pause_all": pause_all_flag
     }
-    data = json.dumps(payload)
-    for q in list(subscribers):
-        try:
-            await q.put(data)
-        except Exception:
-            pass
+    await _publish_json_payload(payload)
+
+
+async def publish_item_update(id_: str, progress: Optional[Dict[str, Any]] = None):
+    payload: Dict[str, Any] = {"type": "item_update", "id": id_}
+    if progress is not None:
+        payload["progress"] = progress
+    await _publish_json_payload(payload)
 
 
 async def periodic_state_publisher():
@@ -1053,6 +1099,7 @@ INDEX_HTML = r"""
 <script>
     let sse;
     let reconnectTimer = null;
+    let sseSuspended = false;
     let currentTab = 'all';
     let stateCache = { queue: [] };
     let pauseAllCache = false;
@@ -1102,7 +1149,22 @@ INDEX_HTML = r"""
         }
     }
 
+    function detachSSE(clearReconnect = true) {
+        if (clearReconnect && reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
+        if (sse) {
+            try {
+                sse.close();
+            } catch (e) {
+            }
+            sse = null;
+        }
+    }
+
     function attachSSE() {
+        if (sseSuspended || document.hidden) return;
         if (sse) {
             try {
                 sse.close();
@@ -1113,12 +1175,20 @@ INDEX_HTML = r"""
         sse.onmessage = e => {
             try {
                 const st = JSON.parse(e.data);
+                if (st && st.type === 'item_update') {
+                    applyItemUpdateMessage(st);
+                    return;
+                }
                 handleState(st);
             } catch (err) {
                 console.error('SSE JSON error', err, e.data);
             }
         };
         sse.onerror = err => { /* console.warn('SSE error - reconnecting', err); */
+            if (sseSuspended || document.hidden) {
+                detachSSE();
+                return;
+            }
             showToastStyled('SSE error - reconnecting', 'warning');
             try {
                 sse.close();
@@ -1127,12 +1197,25 @@ INDEX_HTML = r"""
             if (reconnectTimer) clearTimeout(reconnectTimer);
             reconnectTimer = setTimeout(attachSSE, 3000);
         };
-        window.addEventListener('beforeunload', () => {
-            if (sse) sse.close();
-        });
     }
 
-    attachSSE();
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            sseSuspended = true;
+            detachSSE();
+            return;
+        }
+        sseSuspended = false;
+        // Force next SSE payload to be treated as a full refresh.
+        stateCache = null;
+        attachSSE();
+    });
+
+    window.addEventListener('beforeunload', () => {
+        detachSSE();
+    });
+
+    if (!document.hidden) attachSSE();
 
     function showToastStyled(msg, type = 'success', timeout = 4000) {
         const t = document.createElement('div');
@@ -1484,6 +1567,33 @@ INDEX_HTML = r"""
         incrementalUpdate(st);
     }
 
+    function applyItemUpdateMessage(msg) {
+        if (!msg || !msg.id) return;
+        if (!stateCache || !Array.isArray(stateCache.queue)) return;
+        const it = stateCache.queue.find(x => x && x.id === msg.id);
+        if (!it) return;
+
+        if (Object.prototype.hasOwnProperty.call(msg, 'progress')) it.progress = msg.progress;
+        if (Object.prototype.hasOwnProperty.call(msg, 'status')) it.status = msg.status;
+        if (Object.prototype.hasOwnProperty.call(msg, 'pause_all')) setPauseAllButton(!!msg.pause_all);
+
+        const li = document.querySelector(`#items [data-id="${msg.id}"]`);
+        if (!li) return;
+        const wasChecked = Boolean(li.querySelector('.sel')?.checked);
+        li.innerHTML = buildItemHTML(it);
+        const sel = li.querySelector('.sel');
+        if (sel) {
+            sel.checked = wasChecked;
+            if (!sel._attached) {
+                sel.addEventListener('change', refreshBulkBar);
+                sel._attached = true;
+            }
+        }
+        const status = itemStatus(it);
+        li.style.display = isStatusVisibleInCurrentTab(status) ? 'flex' : 'none';
+        if (wasChecked) refreshBulkBar();
+    }
+
     function updateTabsVisibility(counts) {
         // always show 'all'
         const tabs = document.querySelectorAll('#tabs .tab');
@@ -1622,6 +1732,16 @@ INDEX_HTML = r"""
         filterView();
     });
 
+    function isStatusVisibleInCurrentTab(status) {
+        if (currentTab === 'all') return true;
+        if (currentTab === 'queued') return status === 'paused' || status === 'queued';
+        if (currentTab === 'downloading') return status === 'downloading' || status === 'postprocessing';
+        if (currentTab === 'completed') return status === 'completed';
+        if (currentTab === 'errors') return status === 'error' || status === 'stalled' || status === 'cancelled';
+        if (currentTab === 'duplicates') return status === 'duplicate';
+        return false;
+    }
+
     function filterView() {
         const allItems = Array.from(document.querySelectorAll('#items .item'));
         allItems.forEach(li => {
@@ -1629,12 +1749,7 @@ INDEX_HTML = r"""
             const it = findItemInCache(id);
             if (!it) { li.style.display = 'none'; return; }
             const status = itemStatus(it);
-            if (currentTab === 'all') li.style.display = 'flex';
-            else if (currentTab === 'queued') li.style.display = (status === 'paused' || status === 'queued') ? 'flex' : 'none';
-            else if (currentTab === 'downloading') li.style.display = (status === 'downloading' || status === 'postprocessing') ? 'flex' : 'none';
-            else if (currentTab === 'completed') li.style.display = (status === 'completed') ? 'flex' : 'none';
-            else if (currentTab === 'errors') li.style.display = (status === 'error' || status === 'stalled' || status === 'cancelled') ? 'flex' : 'none';
-            else if (currentTab === 'duplicates') li.style.display = (status === 'duplicate') ? 'flex' : 'none';
+            li.style.display = isStatusVisibleInCurrentTab(status) ? 'flex' : 'none';
         });
     }
 
