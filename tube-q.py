@@ -2,7 +2,9 @@
 """
 Tube-Q : yt-dlp Tube Download Queue
 """
-APP_VERSION = "1.14.0"
+APP_VERSION = "1.15.0"
+APP_GITHUB_REPO = "https://github.com/AnonTester/tube-q"
+APP_GITHUB_COMMITS_API = APP_GITHUB_REPO.replace("https://github.com/", "https://api.github.com/repos/") + "/commits?per_page=1"
 
 import asyncio
 import copy
@@ -57,7 +59,9 @@ DEFAULT_CONFIG = {
     # domain_overrides is a mapping of "comma-separated-domains" -> "ytdlp args string"
     "domain_overrides": {},
     "last_version_check": 0,
-    "yt_dlp_latest": None
+    "yt_dlp_latest": None,
+    "last_tubeq_version_check": 0,
+    "tubeq_latest": None
 }
 CONFIG_PATH = CONF_DIR / "config.json"
 if not CONFIG_PATH.exists():
@@ -333,6 +337,37 @@ def check_latest_ytdlp_version_once_daily():
         return CONFIG.get("yt_dlp_latest")
 
 
+def _extract_tube_q_version_from_commit_message(message: Any) -> Optional[str]:
+    msg = str(message or "").strip()
+    if not msg:
+        return None
+    m = re.search(r"\bTube-Q\s+v(\d+(?:\.\d+){0,3})\b", msg, re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def check_latest_tubeq_version_once_daily() -> Optional[str]:
+    now = time.time()
+    last = CONFIG.get("last_tubeq_version_check", 0)
+    if (now - last) < 86400 and CONFIG.get("tubeq_latest"):
+        return CONFIG.get("tubeq_latest")
+    try:
+        with urllib.request.urlopen(APP_GITHUB_COMMITS_API, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        latest = None
+        if isinstance(data, list) and data:
+            message = (((data[0] or {}).get("commit") or {}).get("message"))
+            latest = _extract_tube_q_version_from_commit_message(message)
+        if latest:
+            CONFIG["tubeq_latest"] = latest
+        CONFIG["last_tubeq_version_check"] = int(now)
+        CONFIG_PATH.write_text(json.dumps(CONFIG, indent=2))
+        return CONFIG.get("tubeq_latest")
+    except Exception:
+        return CONFIG.get("tubeq_latest")
+
+
 def _parse_version_parts(version: Optional[str]) -> Optional[tuple]:
     if version is None:
         return None
@@ -368,9 +403,22 @@ def is_update_available(local_version: Optional[str], latest_version: Optional[s
     return latest_raw != local_raw
 
 
+def is_strict_newer_version(local_version: Optional[str], latest_version: Optional[str]) -> bool:
+    local_parts = _parse_version_parts(local_version)
+    latest_parts = _parse_version_parts(latest_version)
+    if local_parts is None or latest_parts is None:
+        return False
+    length = max(len(local_parts), len(latest_parts))
+    local_norm = local_parts + (0,) * (length - len(local_parts))
+    latest_norm = latest_parts + (0,) * (length - len(latest_parts))
+    return latest_norm > local_norm
+
+
 LOCAL_YTDLP_VERSION = get_local_ytdlp_version()
 LATEST_YTDLP_VERSION = check_latest_ytdlp_version_once_daily()
 UPDATE_AVAILABLE = is_update_available(LOCAL_YTDLP_VERSION, LATEST_YTDLP_VERSION)
+LATEST_TUBEQ_VERSION = check_latest_tubeq_version_once_daily()
+TUBEQ_UPDATE_AVAILABLE = is_strict_newer_version(APP_VERSION, LATEST_TUBEQ_VERSION)
 
 
 # === yt-dlp runner with logging ===
@@ -384,6 +432,8 @@ async def run_yt_dlp_for_item(item: Dict[str, Any]):
     # mark item as actively downloading in unified state
     item["status"] = "downloading"
     progress = {"percent": 0.0, "eta": None, "speed": None, "status": "downloading", "detail": None}
+    # Seed progress immediately so clients can render a bar right away.
+    item["progress"] = progress
     # store process placeholder; will set actual process handle after creation
     DOWNLOADS[id_] = {"item": item, "progress": progress, "process": None}
     QUEUE_STATE[id_] = item
@@ -743,7 +793,7 @@ INDEX_HTML = r"""
     img.favicon{width:18px;height:18px;object-fit:contain;border-radius:3px}
     .small{font-size:0.85rem;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
     .smallnote{font-size:0.85rem;color:var(--muted);}
-    .progress{height:8px;background:#eee;border-radius:6px;overflow:hidden;flex:1;min-width:60px;width:98%;margin:0 8px;}
+    .progress{display:block;height:8px;background:rgba(127,127,127,0.28);border-radius:6px;overflow:hidden;width:100%;margin:0;}
     .progress > div {height: 100%;background: var(--accent);transition: width 0.2s linear;}
     .fill{height:100%;background:var(--accent);width:0%}
     .spinner{width:12px;height:12px;border-radius:50%;border:2px solid rgba(0,0,0,0.1);border-top-color:var(--accent);animation:spin 1s linear infinite;display:inline-block;margin-right:6px}
@@ -848,6 +898,14 @@ INDEX_HTML = r"""
       text-overflow: ellipsis;
     }
 
+    .item .meta-col {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+      flex: 1;
+    }
+
     .item .right-group {
       display: flex;
       justify-content: flex-end;
@@ -869,16 +927,6 @@ INDEX_HTML = r"""
         -webkit-box-orient: vertical;
       }
 
-      /* Stack buttons below the URL */
-      .item{
-        display:block;
-      }
-      .item > div:last-child{
-        margin-left: 0 !important;
-        margin-top: 6px;
-        width:100%;
-        text-align:right;
-      }
       /* Compact favicon */
       img.favicon{
         width: 16px;
@@ -925,7 +973,11 @@ INDEX_HTML = r"""
         width: 100%;
         margin-top: 4px;
         text-align: left; /* keep URL/status left-aligned */
-        align-items: flex-start;
+        align-items: stretch;
+      }
+
+      .item .meta-col {
+        width: 100%;
       }
 
       .item button {
@@ -1032,7 +1084,9 @@ INDEX_HTML = r"""
     </div>
 
     <footer id="footer">
-        <span id="footer-app">Tube-Q v<span id="appVer">loading...</span></span>
+        <span id="footer-app"><a id="appLink" href="https://github.com/AnonTester/tube-q" target="_blank"
+                                  style="color:var(--accent);text-decoration:none;">Tube-Q</a> v<span id="appVer">loading...</span></span>
+        <span id="appUpdateArea"></span>
         &nbsp;|&nbsp;
         <a id="ytdlpLink" href="https://github.com/yt-dlp/yt-dlp" target="_blank"
            style="color:var(--accent);text-decoration:none;">yt-dlp</a>
@@ -1362,14 +1416,22 @@ INDEX_HTML = r"""
         });
     }
 
+    function statusIconMeta(status) {
+        if (status === 'paused') return {className: 'status-icon status-paused', title: 'paused', inlineStyle: ''};
+        if (status === 'downloading' || status === 'postprocessing') {
+            return {className: 'status-icon status-downloading', title: 'downloading/postprocessing', inlineStyle: ''};
+        }
+        if (status === 'completed') return {className: 'status-icon status-complete', title: 'completed', inlineStyle: ''};
+        if (status === 'error') return {className: 'status-icon status-error', title: 'error', inlineStyle: ''};
+        if (status === 'duplicate') return {className: 'status-icon status-duplicate', title: 'duplicate', inlineStyle: ''};
+        if (status === 'stalled') return {className: 'status-icon status-stalled', title: 'stalled', inlineStyle: ''};
+        return {className: 'status-icon', title: 'queued', inlineStyle: 'background:#999'};
+    }
+
     function statusIcon(status) {
-        if (status === 'paused') return '<span class="status-icon status-paused" title="paused"></span>';
-        if (status === 'downloading' || status === 'postprocessing') return '<span class="status-icon status-downloading" title="downloading/postprocessing"></span>';
-        if (status === 'completed') return '<span class="status-icon status-complete" title="completed"></span>';
-        if (status === 'error') return '<span class="status-icon status-error" title="error"></span>';
-        if (status === 'duplicate') return '<span class="status-icon status-duplicate" title="duplicate"></span>';
-        if (status === 'stalled') return '<span class="status-icon status-stalled" title="stalled"></span>';
-        return '<span class="status-icon" style="background:#999"></span>';
+        const meta = statusIconMeta(status);
+        const style = meta.inlineStyle ? ` style="${meta.inlineStyle}"` : '';
+        return `<span class="${meta.className}" title="${meta.title}"${style}></span>`;
     }
 
     function truncateSingleLine(str, maxChars) {
@@ -1378,12 +1440,7 @@ INDEX_HTML = r"""
         return str.slice(0, maxChars - 1) + '…';
     }
 
-    function buildItemHTML(it) {
-        const status = itemStatus(it);
-        const favicon = it.favicon || '_generic.ico';
-        const id = it.id;
-        const url = it.url;
-        const mobile = isMobileViewport();
+    function buildRightButtonsHTML(id, status, mobile) {
         let rightButtons = '';
         if (status === 'paused') rightButtons += `<button onclick="resumeQueued('${id}')">Resume</button> `;
         if (status === 'error' || status === 'stalled' || status === 'duplicate') {
@@ -1405,30 +1462,47 @@ INDEX_HTML = r"""
                 ? `<button class="mobile-icon-btn icon-remove" title="Remove" aria-label="Remove" onclick="removeEntry('${id}')">✖</button>`
                 : `<button onclick="removeEntry('${id}')">Remove</button>`;
         }
-        let progressHTML = '';
+        return rightButtons;
+    }
+
+    function getItemRenderModel(it, status) {
+        const activeProgress = status === 'downloading' || status === 'postprocessing' || (it.progress && it.progress.status === 'waiting');
+        const rawPct = Number(it.progress && it.progress.percent != null ? it.progress.percent : 0);
+        const pct = Number.isFinite(rawPct) ? Math.max(0, Math.min(100, rawPct)) : 0;
+        const pctText = it.progress ? `${Math.round(pct)}%` : '';
+        const etaText = it.progress && it.progress.eta ? `ETA: ${it.progress.eta}` : '';
+
         let smallText = '';
-        let pctText = '';
-        let etaText = '';
-        if (it.progress) {
-            const rawPct = Number(it.progress.percent || 0);
-            const pct = Number.isFinite(rawPct) ? Math.max(0, Math.min(100, rawPct)) : 0;
-            progressHTML = `<div class="progress" style="flex:1;"><div class="fill" style="width:${pct}%"></div></div>`;
-            pctText = `${Math.round(pct)}%`;
-            etaText = it.progress.eta ? `ETA: ${it.progress.eta}` : '';
-        }
         if (it.error && it.last_output) {
-            smallText = `<div class="small">${escapeHtml(truncateSingleLine(it.last_output, 120))}</div>`;
+            smallText = truncateSingleLine(it.last_output, 120);
         } else if (it.progress && it.progress.status === 'postprocessing' && it.progress.detail) {
             // show current post-processing log line to indicate what is being worked on
-            smallText = `<div class="small">${escapeHtml(truncateSingleLine(it.progress.detail, 120))}</div>`;
+            smallText = truncateSingleLine(it.progress.detail, 120);
         } else if (status === 'downloading' || status === 'postprocessing' || (it.progress && it.progress.status === 'waiting')) {
             const progressLine = [status];
             if (pctText) progressLine.push(pctText);
             if (etaText) progressLine.push(etaText);
-            smallText = `<div class="small">${progressLine.join(' • ')}</div>`;
+            smallText = progressLine.join(' • ');
         } else {
-            smallText = `<div class="small">${status}</div>`;
+            smallText = status;
         }
+        return {
+            pct,
+            showProgress: Boolean(it.progress || activeProgress),
+            smallText,
+        };
+    }
+
+    function buildItemHTML(it) {
+        const status = itemStatus(it);
+        const favicon = it.favicon || '_generic.ico';
+        const id = it.id;
+        const url = it.url;
+        const mobile = isMobileViewport();
+        const rightButtons = buildRightButtonsHTML(id, status, mobile);
+        const m = getItemRenderModel(it, status);
+        const progressHTML = m.showProgress ? `<div class="progress"><div class="fill" style="width:${m.pct}%"></div></div>` : '';
+        const smallText = `<div class="small">${escapeHtml(m.smallText)}</div>`;
 
         if (!mobile) {
             // desktop interface
@@ -1441,9 +1515,10 @@ INDEX_HTML = r"""
             </div>
           </div>
           <div class="bottom-row">
-            <div class="url-text"><strong>${escapeHtml(url)}</strong>
-            ${smallText}
-            ${progressHTML}
+            <div class="meta-col">
+              <div class="url-text"><strong>${escapeHtml(url)}</strong></div>
+              ${smallText}
+              ${progressHTML}
             </div>
             <div class="right-group">${rightButtons}</div>
           </div>`;
@@ -1459,12 +1534,100 @@ INDEX_HTML = r"""
             <div class="right-group">${rightButtons}</div>
           </div>
           <div class="bottom-row">
-            <div class="url-text"><strong>${escapeHtml(url)}</strong></div>
-            ${smallText}
-            ${progressHTML}
+            <div class="meta-col">
+              <div class="url-text"><strong>${escapeHtml(url)}</strong></div>
+              ${smallText}
+              ${progressHTML}
+            </div>
           </div>`;
         }
 
+    }
+
+    function renderItemRow(li, it, opts = {}) {
+        const preserveChecked = opts.preserveChecked !== false;
+        const forceFull = !!opts.forceFull;
+        const status = itemStatus(it);
+        const id = String((it && it.id) || '');
+        const url = String((it && it.url) || '');
+        const favicon = it.favicon || '_generic.ico';
+        const mobile = isMobileViewport();
+        const layoutMarker = mobile ? '1' : '0';
+        const previousChecked = preserveChecked ? Boolean(li.querySelector('.sel')?.checked) : false;
+        const m = getItemRenderModel(it, status);
+
+        const canPatch = !forceFull
+            && li.getAttribute('data-layout-mobile') === layoutMarker
+            && li.querySelector('.top-row')
+            && li.querySelector('.meta-col')
+            && li.querySelector('.right-group')
+            && li.querySelector('.sel')
+            && li.querySelector('.status-icon')
+            && li.querySelector('.favicon')
+            && li.querySelector('.url-text strong');
+
+        if (!canPatch) {
+            li.innerHTML = buildItemHTML(it);
+        } else {
+            const iconEl = li.querySelector('.status-icon');
+            const iconMeta = statusIconMeta(status);
+            iconEl.className = iconMeta.className;
+            iconEl.title = iconMeta.title;
+            iconEl.style.cssText = iconMeta.inlineStyle || '';
+
+            const faviconEl = li.querySelector('.favicon');
+            if (faviconEl.getAttribute('src') !== `/favicons/${favicon}`) {
+                faviconEl.setAttribute('src', `/favicons/${favicon}`);
+            }
+
+            const urlStrong = li.querySelector('.url-text strong');
+            if (urlStrong && urlStrong.textContent !== url) urlStrong.textContent = url;
+
+            const metaCol = li.querySelector('.meta-col');
+            let smallEl = li.querySelector('.meta-col .small');
+            if (!smallEl) {
+                smallEl = document.createElement('div');
+                smallEl.className = 'small';
+                metaCol.appendChild(smallEl);
+            }
+            if (smallEl.textContent !== m.smallText) smallEl.textContent = m.smallText;
+
+            let progressEl = li.querySelector('.meta-col .progress');
+            if (m.showProgress) {
+                if (!progressEl) {
+                    progressEl = document.createElement('div');
+                    progressEl.className = 'progress';
+                    progressEl.innerHTML = '<div class="fill"></div>';
+                    metaCol.appendChild(progressEl);
+                }
+                let fillEl = progressEl.querySelector('.fill');
+                if (!fillEl) {
+                    fillEl = document.createElement('div');
+                    fillEl.className = 'fill';
+                    progressEl.innerHTML = '';
+                    progressEl.appendChild(fillEl);
+                }
+                fillEl.style.width = `${m.pct}%`;
+            } else if (progressEl) {
+                progressEl.remove();
+            }
+
+            const rightGroup = li.querySelector('.right-group');
+            const rightButtons = buildRightButtonsHTML(id, status, mobile);
+            if (rightGroup.innerHTML !== rightButtons) rightGroup.innerHTML = rightButtons;
+        }
+
+        li.setAttribute('data-id', id);
+        li.setAttribute('data-layout-mobile', layoutMarker);
+        const sel = li.querySelector('.sel');
+        if (sel) {
+            sel.setAttribute('data-id', id);
+            sel.checked = previousChecked;
+            if (!sel._attached) {
+                sel.addEventListener('change', refreshBulkBar);
+                sel._attached = true;
+            }
+        }
     }
 
     // very small html escape helper for injected text
@@ -1472,6 +1635,49 @@ INDEX_HTML = r"""
         return String(s).replace(/[&<>"]/g, function (c) {
             return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c];
         });
+    }
+
+    function getQueueScrollAnchor() {
+        const box = document.getElementById('mainBox');
+        if (!box) return null;
+        const atBottom = (box.scrollTop + box.clientHeight >= box.scrollHeight - 2);
+        if (atBottom) return {atBottom: true};
+        const boxTop = box.getBoundingClientRect().top;
+        const rows = Array.from(document.querySelectorAll('#items .item'));
+        for (const row of rows) {
+            if (row.style.display === 'none') continue;
+            const rect = row.getBoundingClientRect();
+            if (rect.bottom > boxTop) {
+                return {
+                    atBottom: false,
+                    id: row.getAttribute('data-id'),
+                    offsetTop: rect.top - boxTop,
+                    scrollTop: box.scrollTop
+                };
+            }
+        }
+        return {atBottom: false, id: null, offsetTop: 0, scrollTop: box.scrollTop};
+    }
+
+    function restoreQueueScrollAnchor(anchor) {
+        if (!anchor) return;
+        const box = document.getElementById('mainBox');
+        if (!box) return;
+        if (anchor.atBottom) {
+            box.scrollTop = box.scrollHeight;
+            return;
+        }
+        if (anchor.id) {
+            const rows = Array.from(document.querySelectorAll('#items .item'));
+            const row = rows.find(x => x.getAttribute('data-id') === anchor.id);
+            if (row && row.style.display !== 'none') {
+                const boxTop = box.getBoundingClientRect().top;
+                const newOffsetTop = row.getBoundingClientRect().top - boxTop;
+                box.scrollTop += (newOffsetTop - anchor.offsetTop);
+                return;
+            }
+        }
+        box.scrollTop = anchor.scrollTop || 0;
     }
 
     function fullRender(st) {
@@ -1484,7 +1690,7 @@ INDEX_HTML = r"""
             const li = document.createElement('li');
             li.className = 'item';
             li.setAttribute('data-id', it.id);
-            li.innerHTML = buildItemHTML(it);
+            renderItemRow(li, it, {preserveChecked: false, forceFull: true});
             itemsEl.appendChild(li);
         });
 
@@ -1504,42 +1710,71 @@ INDEX_HTML = r"""
 
     function incrementalUpdate(st) {
         // Update only changed items in the list for minimal DOM churn.
+        const scrollAnchor = getQueueScrollAnchor();
         const prevMap = {};
         const prev = stateCache && Array.isArray(stateCache.queue) ? stateCache.queue : [];
-        prev.forEach(it => { if (it && it.id) prevMap[it.id] = it; });
+        prev.forEach(it => { if (it && it.id) prevMap[String(it.id)] = it; });
 
         const now = Array.isArray(st.queue) ? st.queue : [];
         const sortedNow = sortQueueItems(now);
-        const nowIds = new Set(sortedNow.map(it => it.id));
+        const desiredIds = sortedNow
+            .map(it => String((it && it.id) || ''))
+            .filter(Boolean);
+        const nowIds = new Set(desiredIds);
         const itemsEl = document.getElementById('items');
+        let hasStructuralChanges = false;
 
-        // remove stale elements that no longer exist
-        const existingEls = Array.from(itemsEl.querySelectorAll('.item'));
-        existingEls.forEach(el => {
+        const existingById = new Map();
+        Array.from(itemsEl.querySelectorAll('.item')).forEach(el => {
             const id = el.getAttribute('data-id');
-            if (!nowIds.has(id)) el.remove();
+            if (id) existingById.set(id, el);
         });
 
-        // update content and then re-append in sorted order to preserve ordering across status changes
+        // remove stale elements that no longer exist
+        Array.from(existingById.entries()).forEach(([id, el]) => {
+            if (!nowIds.has(id)) {
+                el.remove();
+                existingById.delete(id);
+                hasStructuralChanges = true;
+            }
+        });
+
+        // update existing elements and create new ones
         sortedNow.forEach(it => {
-            let li = itemsEl.querySelector(`[data-id="${it.id}"]`);
+            const id = String((it && it.id) || '');
+            if (!id) return;
+            let li = existingById.get(id);
             if (li) {
-                const prevIt = prevMap[it.id];
+                const prevIt = prevMap[id];
                 // shallow JSON compare (good enough for UI updates)
                 if (!prevIt || JSON.stringify(prevIt) !== JSON.stringify(it)) {
-                    const wasChecked = Boolean(li.querySelector('.sel')?.checked);
-                    li.innerHTML = buildItemHTML(it);
-                    const sel = li.querySelector('.sel');
-                    if (sel) sel.checked = wasChecked;
+                    renderItemRow(li, it);
                 }
             } else {
                 li = document.createElement('li');
                 li.className = 'item';
-                li.setAttribute('data-id', it.id);
-                li.innerHTML = buildItemHTML(it);
+                li.setAttribute('data-id', id);
+                renderItemRow(li, it, {preserveChecked: false, forceFull: true});
+                existingById.set(id, li);
+                hasStructuralChanges = true;
             }
-            itemsEl.appendChild(li);
         });
+
+        // only reorder if structure/order actually changed
+        const currentOrder = Array.from(itemsEl.querySelectorAll('.item'))
+            .map(el => el.getAttribute('data-id'))
+            .filter(Boolean);
+        const orderChanged = hasStructuralChanges
+            || currentOrder.length !== desiredIds.length
+            || desiredIds.some((id, idx) => currentOrder[idx] !== id);
+        if (orderChanged) {
+            const frag = document.createDocumentFragment();
+            desiredIds.forEach(id => {
+                const li = existingById.get(id);
+                if (li) frag.appendChild(li);
+            });
+            itemsEl.appendChild(frag);
+        }
 
         const c = countsFromState(st);
         document.getElementById('cnt-all').innerText = c.all;
@@ -1555,6 +1790,7 @@ INDEX_HTML = r"""
         // Re-apply active-tab filtering whenever statuses change.
         filterView();
         attachSelectionHandlers();
+        if (orderChanged) restoreQueueScrollAnchor(scrollAnchor);
     }
 
     function handleState(st) {
@@ -1573,22 +1809,30 @@ INDEX_HTML = r"""
         const it = stateCache.queue.find(x => x && x.id === msg.id);
         if (!it) return;
 
-        if (Object.prototype.hasOwnProperty.call(msg, 'progress')) it.progress = msg.progress;
-        if (Object.prototype.hasOwnProperty.call(msg, 'status')) it.status = msg.status;
+        let changed = false;
+        if (Object.prototype.hasOwnProperty.call(msg, 'progress')) {
+            const oldProgress = JSON.stringify(it.progress || null);
+            const newProgress = JSON.stringify(msg.progress || null);
+            if (oldProgress !== newProgress) {
+                it.progress = msg.progress;
+                changed = true;
+            }
+        }
+        if (Object.prototype.hasOwnProperty.call(msg, 'status')) {
+            const oldStatus = String(it.status || '');
+            const newStatus = String(msg.status || '');
+            if (oldStatus !== newStatus) {
+                it.status = msg.status;
+                changed = true;
+            }
+        }
         if (Object.prototype.hasOwnProperty.call(msg, 'pause_all')) setPauseAllButton(!!msg.pause_all);
+        if (!changed) return;
 
         const li = document.querySelector(`#items [data-id="${msg.id}"]`);
         if (!li) return;
         const wasChecked = Boolean(li.querySelector('.sel')?.checked);
-        li.innerHTML = buildItemHTML(it);
-        const sel = li.querySelector('.sel');
-        if (sel) {
-            sel.checked = wasChecked;
-            if (!sel._attached) {
-                sel.addEventListener('change', refreshBulkBar);
-                sel._attached = true;
-            }
-        }
+        renderItemRow(li, it);
         const status = itemStatus(it);
         li.style.display = isStatusVisibleInCurrentTab(status) ? 'flex' : 'none';
         if (wasChecked) refreshBulkBar();
@@ -1761,13 +2005,25 @@ INDEX_HTML = r"""
     fetch('/version').then(r => r.json()).then(j => {
         const localVer = j.yt_dlp_version || 'unknown';
         const latestVer = j.latest_ytdlp || '';
+        const latestAppVer = j.latest_tubeq || '';
         document.getElementById('ytdlpVer').innerText = localVer;
         document.getElementById('appVer').innerText = j.app_version || 'unknown';
+        renderTubeQUpdateArea(Boolean(j.tubeq_update_available), latestAppVer);
         document.getElementById('currentVerText').innerText = localVer;
         document.getElementById('latestVerText').innerText = latestVer;
         // render update link area if needed
         renderUpdateArea(Boolean(j.update_available), latestVer);
     });
+
+    function renderTubeQUpdateArea(available, latest) {
+        const el = document.getElementById('appUpdateArea');
+        if (!el) return;
+        if (!available || !latest) {
+            el.innerHTML = '';
+            return;
+        }
+        el.innerHTML = `&nbsp;|&nbsp; <span style="color:yellow;">update available (${escapeHtml(latest)})</span>`;
+    }
 
     function renderUpdateArea(available, latest) {
         const el = document.getElementById('updateArea');
@@ -1869,7 +2125,7 @@ INDEX_HTML = r"""
             const it = findItemInCache(id);
             if (it) { it.status = 'queued'; it.paused = false; }
             const el = document.querySelector(`#items [data-id="${id}"]`);
-            if (el && it) el.innerHTML = buildItemHTML(it);
+            if (el && it) renderItemRow(el, it);
         });
         filterView();
         try {
@@ -1885,7 +2141,7 @@ INDEX_HTML = r"""
         if (ids.length === 0) return showToastStyled('No selection', 'error');
         // optimistic
         ids.forEach(id => {
-            const it = findItemInCache(id); if (it) { it.paused = true; it.status = 'paused'; const el = document.querySelector(`#items [data-id="${id}"]`); if (el) el.innerHTML = buildItemHTML(it); }
+            const it = findItemInCache(id); if (it) { it.paused = true; it.status = 'paused'; const el = document.querySelector(`#items [data-id="${id}"]`); if (el) renderItemRow(el, it); }
         });
         filterView();
         try {
@@ -1900,7 +2156,7 @@ INDEX_HTML = r"""
         const ids = await getSelectedIds();
         if (ids.length === 0) return showToastStyled('No selection', 'error');
         ids.forEach(id => {
-            const it = findItemInCache(id); if (it) { it.paused = false; it.status = 'queued'; const el = document.querySelector(`#items [data-id="${id}"]`); if (el) el.innerHTML = buildItemHTML(it); }
+            const it = findItemInCache(id); if (it) { it.paused = false; it.status = 'queued'; const el = document.querySelector(`#items [data-id="${id}"]`); if (el) renderItemRow(el, it); }
         });
         filterView();
         try {
@@ -2000,7 +2256,7 @@ INDEX_HTML = r"""
             it.paused = false;
             it.status = 'queued';
             const el = document.querySelector(`#items [data-id="${id}"]`);
-            if (el) el.innerHTML = buildItemHTML(it);
+            if (el) renderItemRow(el, it);
         }
         filterView();
         showToastStyled('Resumed');
@@ -2017,7 +2273,7 @@ INDEX_HTML = r"""
             it.status = 'queued';
             it.added_at = Math.floor(Date.now() / 1000);
             const el = document.querySelector(`#items [data-id="${id}"]`);
-            if (el) el.innerHTML = buildItemHTML(it);
+            if (el) renderItemRow(el, it);
         }
         filterView();
         showToastStyled('Retry queued');
@@ -2034,7 +2290,7 @@ INDEX_HTML = r"""
             it.status = 'queued';
             it.added_at = Math.floor(Date.now() / 1000);
             const el = document.querySelector(`#items [data-id="${id}"]`);
-            if (el) el.innerHTML = buildItemHTML(it);
+            if (el) renderItemRow(el, it);
         }
         filterView();
         showToastStyled('Cancel queued');
@@ -2902,15 +3158,20 @@ async def dump_duplicates():
 
 @app.get('/version')
 async def version():
-    global LOCAL_YTDLP_VERSION, LATEST_YTDLP_VERSION, UPDATE_AVAILABLE
+    global LOCAL_YTDLP_VERSION, LATEST_YTDLP_VERSION, UPDATE_AVAILABLE, LATEST_TUBEQ_VERSION, TUBEQ_UPDATE_AVAILABLE
     local_version = get_yt_dlp_version()
     latest_version = check_latest_ytdlp_version_once_daily()
+    latest_tubeq = check_latest_tubeq_version_once_daily()
     LOCAL_YTDLP_VERSION = local_version
     LATEST_YTDLP_VERSION = latest_version
     UPDATE_AVAILABLE = is_update_available(local_version, latest_version)
+    LATEST_TUBEQ_VERSION = latest_tubeq
+    TUBEQ_UPDATE_AVAILABLE = is_strict_newer_version(APP_VERSION, latest_tubeq)
     return JSONResponse({'yt_dlp_version': local_version, 'app_version': APP_VERSION,
                          'latest_ytdlp': latest_version,
-                         'update_available': UPDATE_AVAILABLE})
+                         'update_available': UPDATE_AVAILABLE,
+                         'latest_tubeq': latest_tubeq,
+                         'tubeq_update_available': TUBEQ_UPDATE_AVAILABLE})
 
 
 @app.get('/health')
