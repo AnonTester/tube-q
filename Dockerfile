@@ -8,7 +8,7 @@ RUN apt-get update && \
     apt-get install -y python3 python3-pip \
       curl wget gnupg ca-certificates jq ffmpeg && \
     rm -rf /var/lib/apt/lists/* && \
-    pip3 install --no-cache-dir yt-dlp fastapi uvicorn jinja2 sse-starlette aiohttp requests
+    pip3 install --no-cache-dir yt-dlp fastapi uvicorn jinja2 sse-starlette aiohttp requests pycryptodome
 
 WORKDIR /app
 

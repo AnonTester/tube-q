@@ -27,6 +27,7 @@ Main features:
 - Check for new yt-dlp version and update function
 - Easy browser integration (send current page or link to Tube-Q)
 - No account or login needed — just open your browser to use it
+- Optional JDownloader2 backup: offload failed downloads to a My.JDownloader-linked JDownloader2 instance
 
 ---
 
@@ -170,6 +171,27 @@ Example Tube-Q defaults:
 }
 ```
 
+
+## 🧰 JDownloader2 backup
+
+Tube-Q can hand off downloads that yt-dlp fails on to a [JDownloader2](https://jdownloader.org/) instance linked to your [My.JDownloader](https://my.jdownloader.org/) account, via the official My.JDownloader API.
+
+To set this up, open **Settings → JDownloader2**:
+
+- **Enable JDownloader2 backup** – turns the integration on.
+- **Automatically send failed downloads to JDownloader2** – when checked, any URL that yt-dlp fails to download is automatically sent to JDownloader2's link collector, the download is started there, and the item is removed from the Tube-Q queue.
+- **Preferred resolution** – when a link resolves to several resolutions (e.g. a page offering 480p/720p/1080p/2160p versions of the same video), only the version matching this preference is kept; the rest are discarded from JDownloader2's link collector before the download starts. Choices are `all` (no filtering, every resolution found is downloaded), `lowest`, `480p`, `720p`, `1080p`, `2160p`, and `highest` (default). For a fixed-resolution choice, if that exact resolution isn't available the closest one below it is used, falling back to the lowest available if all found resolutions are higher.
+- **My.JDownloader Email / Password** – the credentials for your My.JDownloader account.
+- **Test connection / List devices** – connects to the My.JDownloader API with the entered credentials and lists the JDownloader instances linked to your account.
+- **Target JDownloader device** – select which linked JDownloader instance should receive the links.
+
+Once enabled and configured, a **"Send all Errors to JDownloader2"** option appears in the queue's hamburger menu whenever there are entries with an error status, letting you offload all current errors to JDownloader2 on demand. Each individual failed item also gets its own **"Send to JD2"** button next to its Retry button for offloading that single download.
+
+When links are sent to JDownloader2, its link collector is used to resolve the page first; any resulting files that aren't recognized video formats (e.g. `.html`, `.js`, `.gif`, `.jpg`) are discarded, and only the actual video files matching the preferred resolution are moved to the download list and started.
+
+Your My.JDownloader email and password are stored in `conf/config.json` alongside the rest of the Tube-Q configuration.
+
+---
 
 ## 🔗 Sending URLs to Tube-Q
 
