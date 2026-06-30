@@ -2,7 +2,7 @@
 """
 Tube-Q : yt-dlp Tube Download Queue
 """
-APP_VERSION = "1.17.0"
+APP_VERSION = "1.17.1"
 APP_GITHUB_REPO = "https://github.com/AnonTester/tube-q"
 APP_GITHUB_COMMITS_API = APP_GITHUB_REPO.replace("https://github.com/", "https://api.github.com/repos/") + "/commits?per_page=1"
 
@@ -68,6 +68,7 @@ DEFAULT_CONFIG = {
     "yt_dlp_latest": None,
     "last_tubeq_version_check": 0,
     "tubeq_latest": None,
+    "tubeq_latest_checked_app_version": None,
     # JDownloader2 (My.JDownloader) backup/offload settings
     "jdownloader": {
         "enabled": False,
@@ -671,7 +672,13 @@ def _extract_tube_q_version_from_commit_message(message: Any) -> Optional[str]:
 def check_latest_tubeq_version_once_daily() -> Optional[str]:
     now = time.time()
     last = CONFIG.get("last_tubeq_version_check", 0)
-    if (now - last) < 86400 and CONFIG.get("tubeq_latest"):
+    # the cached "latest" value was computed while a (possibly older or newer)
+    # build of Tube-Q was running; conf/config.json survives container
+    # rebuilds, so a redeploy can leave a stale cached value in place for up
+    # to 24h. Force a fresh check whenever the running APP_VERSION differs
+    # from the version that was active when we last checked.
+    same_build = CONFIG.get("tubeq_latest_checked_app_version") == APP_VERSION
+    if same_build and (now - last) < 86400 and CONFIG.get("tubeq_latest"):
         return CONFIG.get("tubeq_latest")
     try:
         with urllib.request.urlopen(APP_GITHUB_COMMITS_API, timeout=8) as resp:
@@ -683,6 +690,7 @@ def check_latest_tubeq_version_once_daily() -> Optional[str]:
         if latest:
             CONFIG["tubeq_latest"] = latest
         CONFIG["last_tubeq_version_check"] = int(now)
+        CONFIG["tubeq_latest_checked_app_version"] = APP_VERSION
         CONFIG_PATH.write_text(json.dumps(CONFIG, indent=2))
         return CONFIG.get("tubeq_latest")
     except Exception:
@@ -3822,9 +3830,13 @@ async def dump_duplicates():
 @app.get('/version')
 async def version():
     global LOCAL_YTDLP_VERSION, LATEST_YTDLP_VERSION, UPDATE_AVAILABLE, LATEST_TUBEQ_VERSION, TUBEQ_UPDATE_AVAILABLE
-    local_version = get_yt_dlp_version()
-    latest_version = check_latest_ytdlp_version_once_daily()
-    latest_tubeq = check_latest_tubeq_version_once_daily()
+    # these do blocking subprocess/HTTP I/O (GitHub API calls can each take
+    # seconds); run them off the event loop so a cache-miss here doesn't
+    # stall every other request (SSE progress, queue actions, ...) for
+    # everyone connected while both checks run
+    local_version = await asyncio.to_thread(get_yt_dlp_version)
+    latest_version = await asyncio.to_thread(check_latest_ytdlp_version_once_daily)
+    latest_tubeq = await asyncio.to_thread(check_latest_tubeq_version_once_daily)
     LOCAL_YTDLP_VERSION = local_version
     LATEST_YTDLP_VERSION = latest_version
     UPDATE_AVAILABLE = is_update_available(local_version, latest_version)
