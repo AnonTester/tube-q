@@ -145,7 +145,11 @@ This example stores downloads in /download with a subfolder of the domain and th
 ```
 Full description of the possible output template options can be found on the [yt-dlp github page](https://github.com/yt-dlp/yt-dlp#output-template)
 
-
+Domain-specific yt-dlp arguments (different output paths, post-processing,
+proxies, etc. per site) are configured entirely through **Settings → Domain
+Options** in the web UI, stored in `domain_overrides` in `config.json`. This
+is the single place for per-domain config -- there's no separate per-domain
+`.conf` file convention to maintain outside of Settings.
 
 Tube-Q stores its settings in:
 
@@ -179,7 +183,7 @@ Tube-Q can hand off downloads that yt-dlp fails on to a [JDownloader2](https://j
 To set this up, open **Settings → JDownloader2**:
 
 - **Enable JDownloader2 backup** – turns the integration on.
-- **Automatically send failed downloads to JDownloader2** – when checked, any URL that yt-dlp fails to download is automatically sent to JDownloader2's link collector, the download is started there, and the item is removed from the Tube-Q queue.
+- **Automatically send failed downloads to JDownloader2** – when checked, any URL that yt-dlp fails to download is automatically sent to JDownloader2's link collector and the download is started there.
 - **Preferred resolution** – when a link resolves to several resolutions (e.g. a page offering 480p/720p/1080p/2160p versions of the same video), only the version matching this preference is kept; the rest are discarded from JDownloader2's link collector before the download starts. Choices are `all` (no filtering, every resolution found is downloaded), `lowest`, `480p`, `720p`, `1080p`, `2160p`, and `highest` (default). For a fixed-resolution choice, if that exact resolution isn't available the closest one below it is used, falling back to the lowest available if all found resolutions are higher.
 - **My.JDownloader Email / Password** – the credentials for your My.JDownloader account.
 - **Test connection / List devices** – connects to the My.JDownloader API with the entered credentials and lists the JDownloader instances linked to your account.
@@ -189,7 +193,62 @@ Once enabled and configured, a **"Send all Errors to JDownloader2"** option appe
 
 When links are sent to JDownloader2, its link collector is used to resolve the page first; any resulting files that aren't recognized video formats (e.g. `.html`, `.js`, `.gif`, `.jpg`) are discarded, and only the actual video files matching the preferred resolution are moved to the download list and started.
 
+Unlike a plain hand-off, Tube-Q keeps tracking the item after sending it to
+JDownloader2 rather than dropping it from the queue: it shows a distinct
+"sent to JDownloader2" status with live progress (polled from the
+JDownloader2 device), and once the download there finishes, Tube-Q
+automatically runs the same post-processing that domain's yt-dlp config
+would have applied to a normal download (output path/filename template,
+recoding, any configured `--exec` post-processing steps) against the
+downloaded file. If JDownloader2's download fails or the file can't be
+located afterward, the item is marked as an error like any other failed
+download instead of silently disappearing.
+
 Your My.JDownloader email and password are stored in `conf/config.json` alongside the rest of the Tube-Q configuration.
+
+---
+
+## 🧰 FlareSolverr fallback (Cloudflare-protected domains)
+
+Some sites front their pages with Cloudflare's bot-protection challenge,
+which a plain HTTP client like yt-dlp (or JDownloader2's crawler) can't get
+past on its own, even with a valid cookie jar and browser-like headers.
+[FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) solves that
+challenge using a real headless browser; Tube-Q can automatically retry a
+failed download through a FlareSolverr-backed proxy before giving up (or
+falling through to JDownloader2).
+
+This only helps with the *ordinary*, auto-resolving Cloudflare challenge.
+Sites that layer their own interactive captcha on top of that (one that
+needs an actual click/solve, not just a JS challenge) aren't fixable this
+way.
+
+To set this up, open **Settings → FlareSolverr**:
+
+- **Enable FlareSolverr retry** – turns the integration on.
+- **Proxy address** – where the FlareSolverr-backed proxy is reachable
+  (e.g. `http://192.168.1.10:8192`). See `contrib/flaremitm/` in this repo
+  for a ready-to-build proxy that bridges FlareSolverr into something
+  yt-dlp can actually point `--proxy` at (FlareSolverr itself only exposes
+  a request/response API, not a proxy interface).
+- **Domains to retry through FlareSolverr** – comma-separated list of
+  domains that should get this treatment. Only domains you list here (or
+  "apply to all", see below) trigger the retry, so this doesn't add latency
+  to sites that don't need it.
+- **Apply to all domains** – skips the domain list and routes every retry
+  attempt through FlareSolverr. Not recommended outside of testing, since
+  every FlareSolverr-backed request has real added latency compared to a
+  normal fetch.
+
+When a normal yt-dlp attempt fails for a domain configured here, Tube-Q
+retries once through the proxy (keeping normal fast-path performance for
+every other domain and for the first attempt on any domain). If that retry
+also fails, the item falls through to the existing JDownloader2 handoff
+(if enabled) exactly as it would for any other failure.
+
+JDownloader2 doesn't automatically benefit from this -- see
+`contrib/flaremitm/README.md` for how to point JDownloader2's own proxy
+settings at the same proxy for the domains that need it.
 
 ---
 

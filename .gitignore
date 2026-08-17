@@ -3,5 +3,6 @@
 /.venv/
 /__pycache__
 .codex
+.claude/
 AGENTS.md
 CLAUDE.md

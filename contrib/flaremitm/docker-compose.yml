@@ -1,0 +1,39 @@
+name: flaremitm
+
+# Minimal standalone example: FlareSolverr + this proxy on their own network.
+# Adjust to fit your actual setup (e.g. if FlareSolverr already runs
+# elsewhere, drop that service here and just point FLARESOLVERR_URL at it).
+
+services:
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    environment:
+      - LOG_LEVEL=info
+      - TZ=UTC
+    restart: unless-stopped
+    healthcheck:
+      interval: 5m
+      retries: 5
+      start_period: 2m
+      test: curl -f http://localhost:8191/health || exit 1
+      timeout: 20s
+
+  flaremitm:
+    build: .
+    image: flaremitm
+    container_name: flaremitm
+    environment:
+      - TZ=UTC
+      - FLARESOLVERR_URL=http://flaresolverr:8191/v1
+      - FLARESOLVERR_CONFIG_PATH=/config/flaresolverr_proxy.json
+    volumes:
+      # Point this at whatever host path Tube-Q (or whatever else you use)
+      # writes flaresolverr_proxy.json into.
+      - ./flaresolverr_proxy.json:/config/flaresolverr_proxy.json:ro
+    ports:
+      - "8192:8080"
+    restart: unless-stopped
+    depends_on:
+      flaresolverr:
+        condition: service_healthy

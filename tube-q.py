@@ -2,7 +2,7 @@
 """
 Tube-Q : yt-dlp Tube Download Queue
 """
-APP_VERSION = "1.17.2"
+APP_VERSION = "1.18.0"
 APP_GITHUB_REPO = "https://github.com/AnonTester/tube-q"
 APP_GITHUB_COMMITS_API = APP_GITHUB_REPO.replace("https://github.com/", "https://api.github.com/repos/") + "/commits?per_page=1"
 
@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import base64
 import re
+import shlex
 import time
 import datetime
 import signal
@@ -78,6 +79,17 @@ DEFAULT_CONFIG = {
         "device_name": "",
         "auto_send_errors": False,
         "resolution_preference": "highest"
+    },
+    # FlareSolverr-backed proxy (flaremitm) settings -- for domains blocked by
+    # Cloudflare's ordinary (non-interactive) bot-protection challenge, retry
+    # a failed yt-dlp attempt once through this proxy before falling through
+    # to the JDownloader2 handoff. "domains" uses the same comma-separated
+    # convention as domain_overrides.
+    "flaresolverr": {
+        "enabled": False,
+        "mitmproxy_url": "",
+        "domains": "",
+        "apply_to_all": False,
     }
 }
 CONFIG_PATH = CONF_DIR / "config.json"
@@ -85,6 +97,7 @@ if not CONFIG_PATH.exists():
     CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2))
 CONFIG = json.loads(CONFIG_PATH.read_text())
 CONFIG["jdownloader"] = {**DEFAULT_CONFIG["jdownloader"], **(CONFIG.get("jdownloader") or {})}
+CONFIG["flaresolverr"] = {**DEFAULT_CONFIG["flaresolverr"], **(CONFIG.get("flaresolverr") or {})}
 
 
 def _to_pos_int(value: Any, fallback: int) -> int:
@@ -445,7 +458,15 @@ class JDownloaderClient:
         return data.get("list", [])
 
     async def send_links(self, device_id: str, urls: List[str], package_name: str = "Tube-Q",
-                          resolution_pref: str = JD_DEFAULT_RESOLUTION_PREFERENCE):
+                          resolution_pref: str = JD_DEFAULT_RESOLUTION_PREFERENCE) -> List[Dict[str, Any]]:
+        """Add the given urls to the link grabber, keep only recognized video links
+        (filtered by extension and resolution preference), move them to the download
+        list and start downloading. Returns the linkgrabber records (uuid, name,
+        packageUUID) of the links that were kept and moved to the download list, so
+        callers can track those specific downloads to completion -- callers that need
+        reliable per-url attribution should call this once per url rather than
+        batching multiple urls into one call, since the before/after diff below can't
+        otherwise tell which resulting links came from which submitted url."""
         # snapshot the current link grabber contents so we can identify which
         # links result from this addLinks call, regardless of how JDownloader
         # groups/names the resulting package(s)
@@ -481,7 +502,7 @@ class JDownloaderClient:
         }]) or []
         new_links = [link for link in after if link["uuid"] not in before_ids]
         if not new_links:
-            return
+            return []
 
         # only keep recognized video files; discard everything else (html,
         # js, css, images, subtitles, etc. picked up by generic page crawling)
@@ -512,11 +533,36 @@ class JDownloaderClient:
             await self._device_action(device_id, "/linkgrabberv2/moveToDownloadlist", [keep_ids, []])
             await self._device_action(device_id, "/downloadcontroller/start", None)
 
+        return [link for link in new_links if link["uuid"] in set(keep_ids)]
+
+    async def query_download_packages(self, device_id: str) -> List[Dict[str, Any]]:
+        """Return every package currently in the download list (not the link
+        grabber) with progress/completion fields populated, so callers can match
+        against a tracked packageUUID to check on a download started via
+        send_links(). Package-level (not per-link /downloadsV2/queryLinks) because
+        that per-link endpoint times out against this account/device -- confirmed by
+        direct testing, not merely slow -- while queryPackages responds normally.
+        saveTo here is the destination *folder* the package was saved to (from jd2's
+        own filesystem view, e.g. "/output/..." if jd2 is containerized), not a
+        specific file path; combine with the file names captured at submission time
+        via send_links() to find the actual downloaded file(s)."""
+        return await self._device_action(device_id, "/downloadsV2/queryPackages", [{
+            "maxResults": -1, "startAt": 0,
+            "bytesLoaded": True, "bytesTotal": True, "finished": True,
+            "saveTo": True, "status": True, "enabled": True,
+        }]) or []
+
 
 async def send_queue_ids_to_jdownloader(ids: List[str]) -> Dict[str, Any]:
-    """Send the given queue items' URLs to JDownloader2's link collector, start the
-    download there, and remove them from the Tube-Q queue. Raises JDownloaderError
-    if JDownloader2 isn't enabled/configured, or any error raised by JDownloaderClient."""
+    """Validate JDownloader2 is configured, mark the given queue items as being
+    submitted, and kick off a background task that actually does the handoff.
+    Raises JDownloaderError up front if jd2 isn't enabled/configured. Returns
+    immediately -- submitting each url can take a few seconds (jd2 has to crawl the
+    page) and items are submitted one at a time rather than in a single batch call so
+    each queue item can be reliably matched to the jd2 link(s) it produced, so a large
+    batch can take a while; the actual status transitions happen in the background
+    and are reflected via the normal SSE item updates (see _submit_ids_to_jdownloader
+    and jd2_poller)."""
     jd_cfg = CONFIG.get('jdownloader') or {}
     if not jd_cfg.get('enabled'):
         raise JDownloaderError('JDownloader2 backup is not enabled')
@@ -528,31 +574,94 @@ async def send_queue_ids_to_jdownloader(ids: List[str]) -> Dict[str, Any]:
 
     ids = [id_ for id_ in ids if QUEUE_STATE.get(id_, {}).get('url')]
     if not ids:
-        return {'sent': 0, 'removed': []}
-    urls = [QUEUE_STATE[id_]['url'] for id_ in ids]
+        return {'sent': 0}
+
+    for id_ in ids:
+        it = QUEUE_STATE.get(id_)
+        if not it:
+            continue
+        it['status'] = 'sent_to_jd2'
+        it['progress'] = {
+            "percent": 0.0, "eta": None, "speed": None,
+            "status": "sending", "detail": "submitting to JDownloader2",
+        }
+        it.pop('error', None)
+        it.pop('last_output', None)
+        QUEUE_STATE[id_] = it
+    await persist_and_publish()
+
+    asyncio.create_task(_submit_ids_to_jdownloader(list(ids), email, password, device_id, jd_cfg))
+    return {'sent': len(ids)}
+
+
+async def _submit_ids_to_jdownloader(ids: List[str], email: str, password: str, device_id: str,
+                                      jd_cfg: Dict[str, Any]):
+    """Background worker for send_queue_ids_to_jdownloader: submits each queue item's
+    url to jd2 one at a time (see send_links() for why this can't be batched), and
+    records the resulting package uuid + expected filenames on the item so
+    jd2_poller() can pick up monitoring it. Submission failures are recorded on that
+    item as an error rather than raised, so one bad url doesn't stop the rest of the
+    batch."""
     resolution_pref = jd_cfg.get('resolution_preference') or JD_DEFAULT_RESOLUTION_PREFERENCE
     if resolution_pref not in JD_RESOLUTION_OPTIONS:
         resolution_pref = JD_DEFAULT_RESOLUTION_PREFERENCE
 
-    async with JDownloaderClient(email, password) as client:
-        await client.connect()
-        await client.send_links(device_id, urls, resolution_pref=resolution_pref)
+    try:
+        async with JDownloaderClient(email, password) as client:
+            await client.connect()
+            for id_ in ids:
+                it = QUEUE_STATE.get(id_)
+                if not it or it.get('status') != 'sent_to_jd2':
+                    continue
+                url = it.get('url', '')
+                submit_error = None
+                kept_links: List[Dict[str, Any]] = []
+                try:
+                    kept_links = await client.send_links(device_id, [url], resolution_pref=resolution_pref) or []
+                except JDownloaderError as e:
+                    submit_error = str(e)
 
-    removed = []
-    for id_ in ids:
-        it = QUEUE_STATE.pop(id_, None)
-        if it is None:
-            continue
-        append_url_attempt(it.get('url', ''), "sent_to_jdownloader2", uid=id_)
-        lf = LOGS_DIR / f"{id_}.log"
-        if lf.exists():
-            try:
-                lf.unlink()
-            except Exception:
-                pass
-        removed.append(id_)
-    await persist_and_publish()
-    return {'sent': len(urls), 'removed': removed}
+                it = QUEUE_STATE.get(id_)
+                if not it:
+                    continue
+                if not kept_links:
+                    it['status'] = 'error'
+                    it['error'] = (f'JDownloader2 submit failed: {submit_error}' if submit_error
+                                    else 'JDownloader2 found no downloadable video at this URL')
+                    it.pop('progress', None)
+                else:
+                    # a single-url submission should land in one package; if jd2 ever
+                    # splits it across several, only the first is tracked -- fine in
+                    # practice since select_resolution_discards() already trims to one
+                    # preferred file per video, so multiple packages here would be
+                    # unusual rather than the normal case
+                    it['jd2_package_uuid'] = kept_links[0].get('packageUUID')
+                    it['jd2_link_names'] = [l.get('name') for l in kept_links if l.get('name')]
+                    it['jd2_device_id'] = device_id
+                    it['jd2_submitted_at'] = int(time.time())
+                    it['progress'] = {
+                        "percent": 0.0, "eta": None, "speed": None,
+                        "status": "downloading", "detail": "queued in JDownloader2",
+                    }
+                    append_url_attempt(url, "sent_to_jdownloader2", uid=id_)
+                    lf = LOGS_DIR / f"{id_}.log"
+                    if lf.exists():
+                        try:
+                            lf.unlink()
+                        except Exception:
+                            pass
+                QUEUE_STATE[id_] = it
+                await persist_and_publish()
+    except JDownloaderError as e:
+        # connection/auth-level failure: whatever's still pending never got submitted
+        for id_ in ids:
+            it = QUEUE_STATE.get(id_)
+            if it and it.get('status') == 'sent_to_jd2' and not it.get('jd2_package_uuid'):
+                it['status'] = 'error'
+                it['error'] = f'JDownloader2 connection failed: {e}'
+                it.pop('progress', None)
+                QUEUE_STATE[id_] = it
+        await persist_and_publish()
 
 
 # === Persistence ===
@@ -600,7 +709,7 @@ def choose_config_for_url(url: str) -> Optional[str]:
     domain = get_domain(url)
     if not domain:
         return None
-    # 1) domain_overrides in CONFIG -- supports keys like "youtube.com, youtu.be"
+    # domain_overrides in CONFIG -- supports keys like "youtube.com, youtu.be"
     for key, args in (DOMAIN_OVERRIDES or {}).items():
         domains = [d.strip() for d in key.split(',') if d.strip()]
         if domain in domains:
@@ -611,14 +720,43 @@ def choose_config_for_url(url: str) -> Optional[str]:
                 return str(tmp)
             except Exception:
                 return None
-    # 2) legacy per-domain conf files in conf/domains
-    domain_conf = YTDLP_CONFIG_FOLDER / "domains" / f"{domain}.conf"
+    # fallback to default.conf if present (edited via Settings -> "default" tab)
     default_conf = YTDLP_CONFIG_FOLDER / "default.conf"
-    if domain_conf.exists():
-        return str(domain_conf)
     if default_conf.exists():
         return str(default_conf)
     return None
+
+
+def flaresolverr_domain_matches(domain: str) -> bool:
+    """Whether the given domain should be retried through the FlareSolverr
+    proxy (flaremitm) after a normal yt-dlp attempt fails. Uses the same
+    comma-separated-domains convention as domain_overrides."""
+    fs_cfg = CONFIG.get("flaresolverr") or {}
+    if not fs_cfg.get("enabled") or not (fs_cfg.get("mitmproxy_url") or "").strip():
+        return False
+    if fs_cfg.get("apply_to_all"):
+        return True
+    domains = [d.strip().lower() for d in (fs_cfg.get("domains") or "").split(",") if d.strip()]
+    return (domain or "").lower() in domains
+
+
+def write_flaresolverr_proxy_config():
+    """Write the small JSON file the flaremitm addon polls for its domain
+    list + apply_to_all flag, derived from CONFIG["flaresolverr"]. flaremitm
+    runs in a separate container and has no access to Tube-Q's full
+    config.json, so this is the only channel between the two. (FlareSolverr's
+    own URL is infrastructure-level config on the flaremitm container itself
+    -- not part of this file.)"""
+    fs_cfg = CONFIG.get("flaresolverr") or {}
+    domains = [d.strip() for d in (fs_cfg.get("domains") or "").split(",") if d.strip()]
+    payload = {
+        "domains": domains,
+        "apply_to_all": bool(fs_cfg.get("apply_to_all")),
+    }
+    try:
+        (YTDLP_CONFIG_FOLDER / "flaresolverr_proxy.json").write_text(json.dumps(payload, indent=2))
+    except Exception as e:
+        print(f"[flaresolverr] failed to write flaresolverr_proxy.json: {e}")
 
 
 # === yt-dlp version check (daily) ===
@@ -765,6 +903,161 @@ def kill_process_tree(proc):
             proc.kill()
         except Exception:
             pass
+
+
+async def retry_yt_dlp_with_flaresolverr(item: Dict[str, Any], url: str, log_path: Path) -> bool:
+    """Retry a failed yt-dlp attempt once, routing this domain's traffic
+    through flaremitm (the FlareSolverr-backed proxy) instead of fetching
+    directly. Reuses the same patched-temp-config-file technique as
+    postprocess_jd2_download: read the domain's resolved config, strip any
+    existing --proxy line (several domain overrides hardcode one), and
+    append our own so this attempt definitely goes through flaremitm.
+    Returns True (and marks item completed) on success; on failure, leaves
+    item's status as whatever the caller set it to before calling this
+    (expected: 'error') so the existing JDownloader2 handoff can still run."""
+    id_ = item["id"]
+    fs_cfg = CONFIG.get("flaresolverr") or {}
+    proxy_url = (fs_cfg.get("mitmproxy_url") or "").strip()
+    if not proxy_url:
+        return False
+
+    cfg = choose_config_for_url(url)
+    cfg_text = ""
+    if cfg:
+        try:
+            cfg_text = Path(cfg).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            cfg_text = ""
+    cfg_lines = [line for line in cfg_text.splitlines() if not re.match(r"^\s*--proxy(\s|=|$)", line)]
+    cfg_lines.append(f"--proxy {proxy_url}")
+    patched_cfg_path = YTDLP_CONFIG_FOLDER / f"_flaresolverr_{id_}.conf"
+    try:
+        patched_cfg_path.write_text("\n".join(cfg_lines))
+    except Exception:
+        return False
+
+    bin_exec = str(YT_DLP_PATH) if YT_DLP_PATH.exists() else YT_DLP_BINARY
+    ytdlp_args = [bin_exec, "--newline"]
+    if YT_DLP_GLOBAL_ARGS:
+        ytdlp_args += YT_DLP_GLOBAL_ARGS
+    ytdlp_args += ["--config-location", str(patched_cfg_path), url]
+
+    item["status"] = "downloading"
+    # clear the prior failed attempt's error/last_output -- otherwise the UI's
+    # small-text rendering (which checks these before status-based progress
+    # text) keeps showing the stale error for the whole retry, since these
+    # aren't cleared again until the retry itself finishes either way
+    item.pop("error", None)
+    item.pop("last_output", None)
+    progress = {"percent": 0.0, "eta": None, "speed": None, "status": "downloading", "detail": "retrying via FlareSolverr"}
+    item["progress"] = progress
+    DOWNLOADS[id_] = {"item": item, "progress": progress, "process": None}
+    QUEUE_STATE[id_] = item
+    await persist_and_publish()
+
+    # debounce SSE pushes the same way run_yt_dlp_for_item does -- a
+    # fragment-heavy HLS download can print many near-identical [download]
+    # lines per second, and publishing every single one floods the SSE
+    # stream and makes the client's re-renders choppy/appear to freeze
+    last_emit_ts = 0.0
+    last_emit_pct = 0.0
+    last_emit_status = ""
+
+    async def maybe_publish(force: bool = False):
+        nonlocal last_emit_ts, last_emit_pct, last_emit_status
+        now = time.monotonic()
+        pct_now = float(progress.get("percent") or 0.0)
+        status_now = str(progress.get("status") or "")
+        should_emit = force or status_now != last_emit_status \
+            or abs(pct_now - last_emit_pct) >= 1.0 or (now - last_emit_ts) >= 0.75
+        if not should_emit:
+            return
+        last_emit_ts = now
+        last_emit_pct = pct_now
+        last_emit_status = status_now
+        QUEUE_STATE.get(id_, {}).update({"progress": progress})
+        await publish_item_update(id_, progress=progress)
+
+    rc = -1
+    with log_path.open("ab") as lf:
+        lf.write(("Log start (FlareSolverr retry): " +
+                   datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n").encode("UTF-8"))
+        lf.write(f"ARGS: {ytdlp_args}\n".encode("UTF-8"))
+        lf.write(b"--------\n")
+
+        env = dict(**os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *ytdlp_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                limit=1024 * 32,
+                env=env,
+                start_new_session=True,
+            )
+            try:
+                DOWNLOADS[id_]["process"] = proc
+            except Exception:
+                DOWNLOADS[id_] = {"item": item, "progress": progress, "process": proc}
+
+            while True:
+                raw = await proc.stdout.readline()
+                if not raw:
+                    break
+                await asyncio.sleep(0)
+                try:
+                    lf.write(raw)
+                    lf.flush()
+                except Exception:
+                    pass
+                line = raw.decode(errors="ignore").strip()
+                if line.startswith("[download]"):
+                    m_pct = re.search(r"\[download\]\s+(\d{1,3}(?:\.\d+)?)%\s+of", line)
+                    if m_pct:
+                        try:
+                            progress["percent"] = round(float(m_pct.group(1)), 2)
+                        except ValueError:
+                            pass
+                    m_sp = re.search(r"at\s+([0-9.]+[KkMGT]?i?B/s|[0-9.]+[KkMGT]?B/s)", line)
+                    progress["speed"] = m_sp.group(1) if m_sp else None
+                    m_eta = re.search(r"ETA\s+([0-9:]+|--:--:--)", line)
+                    progress["eta"] = m_eta.group(1) if m_eta else None
+                    progress["status"] = "downloading"
+                    progress["detail"] = line
+                    await maybe_publish()
+                    continue
+                if any(ind in line for ind in POSTPROC_INDICATORS):
+                    progress["status"] = "postprocessing"
+                    progress["detail"] = line
+                    await maybe_publish(force=True)
+
+            rc = await proc.wait()
+        except Exception as e:
+            lf.write(f"[error] failed to run yt-dlp: {e}\n".encode("UTF-8"))
+
+        lf.write(("Log end: " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n").encode("UTF-8"))
+        lf.write(b"--------\n")
+
+    DOWNLOADS.pop(id_, None)
+    try:
+        patched_cfg_path.unlink()
+    except Exception:
+        pass
+
+    if rc != 0:
+        return False
+
+    item["status"] = "completed"
+    item["progress"] = {"percent": 100.0, "eta": None, "speed": None, "status": "", "detail": ""}
+    item["completed_at"] = int(time.time())
+    item.pop("error", None)
+    item.pop("last_output", None)
+    if url not in HISTORY:
+        HISTORY.append(url)
+    QUEUE_STATE[id_] = item
+    await persist_and_publish()
+    return True
 
 
 # === yt-dlp runner with logging ===
@@ -978,6 +1271,17 @@ async def run_yt_dlp_for_item(item: Dict[str, Any]):
         lf.write(("Log end: " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n").encode('UTF-8'))
         lf.write("--------\n".encode('UTF-8'))
 
+    if item.get("status") == "error" and flaresolverr_domain_matches(get_domain(url) or ""):
+        prior_error = item.get("error")
+        prior_last_output = item.get("last_output")
+        if not await retry_yt_dlp_with_flaresolverr(item, url, log_path):
+            item["status"] = "error"
+            item["error"] = f"{prior_error} (also failed via FlareSolverr retry)" if prior_error else "FlareSolverr retry failed"
+            item["last_output"] = prior_last_output or item["error"]
+            item.pop("progress", None)
+            QUEUE_STATE[id_] = item
+            await persist_and_publish()
+
     if item.get("status") == "error":
         jd_cfg = CONFIG.get("jdownloader") or {}
         if jd_cfg.get("enabled") and jd_cfg.get("auto_send_errors"):
@@ -985,6 +1289,260 @@ async def run_yt_dlp_for_item(item: Dict[str, Any]):
                 await send_queue_ids_to_jdownloader([id_])
             except Exception as e:
                 print(f"[jdownloader] auto-send for {id_} failed: {e}")
+
+
+# === JDownloader2 completion monitoring & post-processing ===
+async def postprocess_jd2_download(id_: str, saved_path: str):
+    """Run once a jd2 download tracked by jd2_poller() has finished. Re-runs yt-dlp
+    against the local file jd2 saved (via file:// + --enable-file-urls) using the
+    same --config-location the url would have gotten from a normal download, so the
+    domain's usual --output/--recode-video/--exec post-processing (Stash scan-in,
+    bitrate recode, scraper trigger, ...) runs unchanged instead of being
+    reimplemented here. yt-dlp can't populate %(webpage_url_domain)s/%(original_url)s
+    from a local file (no webpage was fetched), so those two are patched into the
+    config text with their real values before use; %(title)s/%(id)s fall back to
+    jd2's filename and %(height)s comes back empty since the generic extractor
+    doesn't probe resolution -- acceptable degradations for a fallback path."""
+    it = QUEUE_STATE.get(id_)
+    if not it:
+        return
+    url = it.get('url', '')
+    domain = get_domain(url) or ''
+    log_path = LOGS_DIR / f"{id_}.log"
+
+    cfg = choose_config_for_url(url)
+    patched_cfg_path: Optional[Path] = None
+    if cfg:
+        try:
+            cfg_text = Path(cfg).read_text(encoding='utf-8', errors='ignore')
+        except Exception:
+            cfg_text = ''
+        cfg_text = cfg_text.replace('%(webpage_url_domain)s', domain)
+        cfg_text = cfg_text.replace('%(original_url)q', shlex.quote(url))
+        cfg_text = cfg_text.replace('%(original_url)s', url)
+        candidate = YTDLP_CONFIG_FOLDER / f"_jd2post_{id_}.conf"
+        try:
+            candidate.write_text(cfg_text)
+            patched_cfg_path = candidate
+        except Exception:
+            patched_cfg_path = None
+
+    bin_exec = str(YT_DLP_PATH) if YT_DLP_PATH.exists() else YT_DLP_BINARY
+    file_url = "file://" + str(Path(saved_path))
+    ytdlp_args = [bin_exec, "--newline", "--enable-file-urls"]
+    if patched_cfg_path:
+        ytdlp_args += ["--config-location", str(patched_cfg_path), file_url]
+    else:
+        ytdlp_args += [file_url]
+
+    with log_path.open("ab") as lf:
+        lf.write(("Log start (JDownloader2 post-processing): " +
+                   datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n").encode('UTF-8'))
+        lf.write(f"Source URL: {url}\n".encode('UTF-8'))
+        lf.write(f"JDownloader2 file: {saved_path}\n".encode('UTF-8'))
+        lf.write(f"ARGS: {ytdlp_args}\n".encode('UTF-8'))
+        if patched_cfg_path:
+            try:
+                lf.write(f"cfg:\n{patched_cfg_path.read_text(encoding='UTF-8')}\n".encode('UTF-8'))
+            except Exception:
+                pass
+        lf.write(b"--------\n")
+
+        env = dict(**os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *ytdlp_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+            while True:
+                raw = await proc.stdout.readline()
+                if not raw:
+                    break
+                try:
+                    lf.write(raw)
+                    lf.flush()
+                except Exception:
+                    pass
+            rc = await proc.wait()
+        except Exception as e:
+            rc = -1
+            lf.write(f"[error] failed to run yt-dlp: {e}\n".encode('UTF-8'))
+
+        lf.write(("Log end: " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n").encode('UTF-8'))
+        lf.write(b"--------\n")
+
+    if patched_cfg_path:
+        try:
+            patched_cfg_path.unlink()
+        except Exception:
+            pass
+
+    it = QUEUE_STATE.get(id_)
+    if not it:
+        return
+    if rc == 0:
+        it['status'] = 'completed'
+        it['progress'] = {"percent": 100.0, "eta": None, "speed": None, "status": "", "detail": ""}
+        it['completed_at'] = int(time.time())
+        it.pop('error', None)
+        if url not in HISTORY:
+            HISTORY.append(url)
+        # yt-dlp copies rather than moves a file:// source, so jd2's own copy is
+        # still sitting in its download folder -- remove it now that post-processing
+        # succeeded, to avoid leaving two copies of every jd2-sourced download around
+        try:
+            saved = Path(saved_path)
+            if saved.exists() and saved.is_file():
+                saved.unlink()
+        except Exception as e:
+            print(f"[jdownloader] failed to remove original jd2 download {saved_path!r}: {e}")
+    else:
+        it['status'] = 'error'
+        it['error'] = 'JDownloader2 download succeeded but post-processing failed (see log)'
+        it['jd2_saved_path'] = saved_path
+        it.pop('progress', None)
+    QUEUE_STATE[id_] = it
+    await persist_and_publish()
+
+
+def _jd2_translate_save_path(save_to: str) -> Optional[Path]:
+    """jd2's saveTo is reported from jd2's own filesystem view. On this deployment
+    jd2 runs containerized with host /mnt/download mounted at /output inside its
+    container, and Tube-Q's own container already bind-mounts the whole host /mnt
+    tree, so translating the /output prefix to /mnt/download gives a path Tube-Q
+    can read directly. Falls back to the raw path (in case jd2 isn't containerized
+    the same way) if it doesn't start with /output."""
+    if not save_to:
+        return None
+    if save_to.startswith('/output/'):
+        return Path('/mnt/download') / save_to[len('/output/'):]
+    if save_to == '/output':
+        return Path('/mnt/download')
+    return Path(save_to)
+
+
+def _jd2_resolve_downloaded_file(save_to: str, expected_names: List[str]) -> Optional[str]:
+    """Given a finished package's saveTo folder and the filename(s) captured when it
+    was submitted, find the actual downloaded video file. Prefers an exact name
+    match (jd2 may sanitize/rename on collision, so this isn't guaranteed), then
+    falls back to the only recognized video file in the folder, then the largest
+    one if there's more than one."""
+    folder = _jd2_translate_save_path(save_to)
+    if not folder or not folder.is_dir():
+        return None
+    try:
+        entries = [p for p in folder.iterdir() if p.is_file()]
+    except Exception:
+        return None
+    for name in expected_names:
+        for p in entries:
+            if p.name == name:
+                return str(p)
+    video_files = [p for p in entries if p.suffix.lstrip('.').lower() in JD_VIDEO_EXTENSIONS]
+    if len(video_files) == 1:
+        return str(video_files[0])
+    if video_files:
+        return str(max(video_files, key=lambda p: p.stat().st_size))
+    return None
+
+
+async def jd2_poller():
+    """Background task: periodically checks on every queue item that's been handed
+    off to JDownloader2 (status == 'sent_to_jd2' with a tracked package uuid),
+    updates its progress from jd2's reported bytesLoaded/bytesTotal, and once jd2
+    reports the package finished, resolves the actual downloaded file and hands it
+    off to postprocess_jd2_download(). If a tracked package disappears from jd2's
+    download list before finishing (removed/cancelled in jd2, or an unexpected
+    packagizer/cleanup interaction) the item is marked as an error rather than left
+    stuck forever -- there's no reliable way to tell that apart from "jd2 already
+    finished and auto-cleared the entry" from this API alone, but jd2 doesn't
+    auto-clear finished downloads by default, so this should be rare."""
+    while True:
+        await asyncio.sleep(25)
+        try:
+            jd_cfg = CONFIG.get('jdownloader') or {}
+            if not jd_cfg.get('enabled'):
+                continue
+            email = jd_cfg.get('email') or ''
+            password = jd_cfg.get('password') or ''
+            device_id = jd_cfg.get('device_id') or ''
+            if not email or not password or not device_id:
+                continue
+
+            pending = {
+                id_: it for id_, it in QUEUE_STATE.items()
+                if it.get('status') == 'sent_to_jd2' and it.get('jd2_package_uuid')
+            }
+            if not pending:
+                continue
+
+            try:
+                async with JDownloaderClient(email, password) as client:
+                    await client.connect()
+                    packages = await client.query_download_packages(device_id)
+            except Exception as e:
+                print(f"[jdownloader] poll failed: {e}")
+                continue
+
+            by_uuid = {p.get('uuid'): p for p in packages}
+
+            for id_, it in pending.items():
+                pkg = by_uuid.get(it.get('jd2_package_uuid'))
+
+                if not pkg:
+                    it = QUEUE_STATE.get(id_)
+                    if it and it.get('status') == 'sent_to_jd2':
+                        it['status'] = 'error'
+                        it['error'] = 'JDownloader2 package no longer in download list (removed or cleared before finishing)'
+                        it.pop('progress', None)
+                        QUEUE_STATE[id_] = it
+                        await persist_and_publish()
+                    continue
+
+                if pkg.get('finished'):
+                    it = QUEUE_STATE.get(id_)
+                    if not it or it.get('status') != 'sent_to_jd2':
+                        continue
+                    saved_path = _jd2_resolve_downloaded_file(
+                        pkg.get('saveTo') or '', it.get('jd2_link_names') or [])
+                    if not saved_path:
+                        it['status'] = 'error'
+                        it['error'] = (
+                            'JDownloader2 reported finished but the downloaded file could not be '
+                            f'located under {pkg.get("saveTo")!r}'
+                        )
+                        it.pop('progress', None)
+                        QUEUE_STATE[id_] = it
+                        await persist_and_publish()
+                        continue
+                    it['progress'] = {
+                        "percent": 100.0, "eta": None, "speed": None,
+                        "status": "postprocessing",
+                        "detail": "JDownloader2 download finished, running post-processing",
+                    }
+                    QUEUE_STATE[id_] = it
+                    await persist_and_publish()
+                    asyncio.create_task(postprocess_jd2_download(id_, saved_path))
+                else:
+                    total_loaded = int(pkg.get('bytesLoaded') or 0)
+                    total_size = int(pkg.get('bytesTotal') or 0)
+                    pct = round((total_loaded / total_size) * 100, 2) if total_size else 0.0
+                    it = QUEUE_STATE.get(id_)
+                    if not it or it.get('status') != 'sent_to_jd2':
+                        continue
+                    it['progress'] = {
+                        "percent": pct, "eta": None, "speed": None,
+                        "status": "downloading",
+                        "detail": f"JDownloader2: {total_loaded}/{total_size} bytes",
+                    }
+                    QUEUE_STATE[id_] = it
+                    await publish_item_update(id_, progress=it['progress'])
+        except Exception as e:
+            print(f"[jdownloader] poller iteration failed: {e}")
 
 
 # === queue processor ===
@@ -1104,8 +1662,10 @@ async def periodic_state_publisher():
 # === FastAPI app & routes ===
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    write_flaresolverr_proxy_config()
     asyncio.create_task(queue_processor())
     asyncio.create_task(periodic_state_publisher())
+    asyncio.create_task(jd2_poller())
     yield
 
 
@@ -1171,8 +1731,64 @@ INDEX_HTML = r"""
     .status-error{background:red}
     .status-duplicate{background:gray}
     .status-stalled{background:purple}
+    .status-jd2{background:#2563eb}
     .ghost.active{background:var(--accent);color:white;border-color:transparent}
-    #settingsModal {height: 90dvh; max-height: 90vh;}
+    /* overflow:hidden overrides the generic .modal{overflow:auto} -- the flex layout
+       below already constrains header/content/save-row to fit exactly, so the outer
+       box scrolling too just produces a second, redundant scrollbar */
+    #settingsModal {height: 90dvh; max-height: 90vh; display:flex; flex-direction:column; overflow:hidden;}
+    #settingsModal .modal-header {flex-shrink:0;}
+    /* Settings modal: tab row fixed, content area fills remaining space and scrolls
+       internally, Save button stays pinned at the bottom instead of scrolling out of
+       view when there are many domain overrides. */
+    #settingsContentWrapper {
+      display:flex;
+      flex-direction:column;
+      flex:1;
+      min-height:0;
+      max-height:none;
+      overflow:hidden;
+    }
+    #settingsContentWrapper > div:first-child {flex-shrink:0;}
+    /* Whether the native scrollbar auto-hides is an OS/browser-chrome setting that
+       page CSS can't reliably override (confirmed: scrollbar-width/-color didn't
+       change Firefox's GTK overlay-scrollbar behavior here). Instead of fighting
+       that, fade the top/bottom edges of the list whenever there's more content in
+       that direction -- a persistent, scrollbar-independent "there's more" cue so
+       entries further down don't get missed. Classic pure-CSS scroll-shadow trick:
+       two solid covers that scroll WITH the content (local) mask two shadow layers
+       fixed to the viewport (scroll), so the shadow only shows at an edge that
+       still has hidden content past it. */
+    #settingsContent {
+      flex:1; min-height:0; overflow-y:auto;
+      background:
+        linear-gradient(var(--card) 30%, rgba(0,0,0,0)) local,
+        linear-gradient(rgba(0,0,0,0), var(--card) 70%) local,
+        radial-gradient(farthest-side at 50% 0, rgba(0,0,0,.28), rgba(0,0,0,0)),
+        radial-gradient(farthest-side at 50% 100%, rgba(0,0,0,.28), rgba(0,0,0,0)) 0 100%;
+      background-repeat: no-repeat;
+      background-color: var(--card);
+      background-size: 100% 32px, 100% 32px, 100% 12px, 100% 12px;
+      background-attachment: local, local, scroll, scroll;
+    }
+    /* -webkit-scrollbar is nonstandard but current Firefox honors it too, and doing
+       so switches it away from the OS's auto-hiding overlay scrollbar to an
+       always-visible one for this element -- confirmed working. */
+    #settingsContent::-webkit-scrollbar {
+      -webkit-appearance: none;
+      width: 7px;
+    }
+    #settingsContent::-webkit-scrollbar-thumb {
+      border-radius: 4px;
+      background-color: rgba(0, 0, 0, .5);
+      -webkit-box-shadow: 0 0 1px rgba(255, 255, 255, .5);
+    }
+    #settingsContentWrapper .btn-row {
+      flex-shrink:0;
+      margin-top:8px;
+      padding-top:8px;
+      border-top:1px solid rgba(127,127,127,0.2);
+    }
     #domain_default_conf {max-height:180px;}
     /* Toasts */
     #toasts{position:fixed;right:18px;bottom:18px;z-index:9999;display:flex;flex-direction:column;gap:8px}
@@ -1483,6 +2099,7 @@ INDEX_HTML = r"""
                 <button id="settingsTabGeneral" class="ghost">General</button>
                 <button id="settingsTabDomains" class="ghost">Domain Options</button>
                 <button id="settingsTabJDownloader" class="ghost">JDownloader2</button>
+                <button id="settingsTabFlareSolverr" class="ghost">FlareSolverr</button>
             </div>
             <div id="settingsContent"></div>
             <div class="btn-row">
@@ -1727,7 +2344,7 @@ INDEX_HTML = r"""
             counts.all += 1;
             const s = itemStatus(it);
             if (s === 'queued' || s === 'paused') counts.queued += 1;
-            if (s === 'downloading' || s === 'postprocessing') counts.downloading += 1;
+            if (s === 'downloading' || s === 'postprocessing' || s === 'sent_to_jd2') counts.downloading += 1;
             if (s === 'completed') counts.completed += 1;
             if (s === 'error' || s === 'stalled' || s === 'cancelled') counts.errors += 1;
             if (s === 'duplicate') counts.duplicates += 1;
@@ -1764,7 +2381,7 @@ INDEX_HTML = r"""
     });
 
     function statusSortRank(status) {
-        if (status === 'downloading' || status === 'postprocessing' || status === 'waiting') return 0;
+        if (status === 'downloading' || status === 'postprocessing' || status === 'waiting' || status === 'sent_to_jd2') return 0;
         if (status === 'queued' || status === 'paused') return 1;
         if (status === 'error' || status === 'stalled' || status === 'cancelled') return 2;
         if (status === 'duplicate') return 3;
@@ -1794,6 +2411,7 @@ INDEX_HTML = r"""
         if (status === 'downloading' || status === 'postprocessing') {
             return {className: 'status-icon status-downloading', title: 'downloading/postprocessing', inlineStyle: ''};
         }
+        if (status === 'sent_to_jd2') return {className: 'status-icon status-jd2', title: 'JDownloader2', inlineStyle: ''};
         if (status === 'completed') return {className: 'status-icon status-complete', title: 'completed', inlineStyle: ''};
         if (status === 'error') return {className: 'status-icon status-error', title: 'error', inlineStyle: ''};
         if (status === 'duplicate') return {className: 'status-icon status-duplicate', title: 'duplicate', inlineStyle: ''};
@@ -1838,7 +2456,7 @@ INDEX_HTML = r"""
                 ? `<button class="mobile-icon-btn icon-jd2" title="Send to JD2" aria-label="Send to JD2" onclick="sendToJDItem('${id}')">📤</button> `
                 : `<button onclick="sendToJDItem('${id}')">Send to JD2</button> `;
         }
-        if (status === 'completed' || status === 'error' || status === 'stalled') {
+        if (status === 'completed' || status === 'error' || status === 'stalled' || status === 'sent_to_jd2') {
             rightButtons += mobile
                 ? `<button class="mobile-icon-btn icon-log" title="Log" aria-label="Log" onclick="openLog('${id}')">📄</button> `
                 : `<button onclick="openLog('${id}')">Log</button> `;
@@ -1856,7 +2474,7 @@ INDEX_HTML = r"""
     }
 
     function getItemRenderModel(it, status) {
-        const activeProgress = status === 'downloading' || status === 'postprocessing' || (it.progress && it.progress.status === 'waiting');
+        const activeProgress = status === 'downloading' || status === 'postprocessing' || status === 'sent_to_jd2' || (it.progress && it.progress.status === 'waiting');
         const rawPct = Number(it.progress && it.progress.percent != null ? it.progress.percent : 0);
         const pct = Number.isFinite(rawPct) ? Math.max(0, Math.min(100, rawPct)) : 0;
         const pctText = it.progress ? `${Math.round(pct)}%` : '';
@@ -1871,8 +2489,8 @@ INDEX_HTML = r"""
             // show current post-processing log line to indicate what is being worked on
             smallTextFull = it.progress.detail;
             smallText = truncateSingleLine(smallTextFull, 120);
-        } else if (status === 'downloading' || status === 'postprocessing' || (it.progress && it.progress.status === 'waiting')) {
-            const progressLine = [status];
+        } else if (status === 'downloading' || status === 'postprocessing' || status === 'sent_to_jd2' || (it.progress && it.progress.status === 'waiting')) {
+            const progressLine = [status === 'sent_to_jd2' ? 'JDownloader2' : status];
             if (pctText) progressLine.push(pctText);
             if (etaText) progressLine.push(etaText);
             smallText = progressLine.join(' • ');
@@ -2405,7 +3023,7 @@ INDEX_HTML = r"""
     function isStatusVisibleInCurrentTab(status) {
         if (currentTab === 'all') return true;
         if (currentTab === 'queued') return status === 'paused' || status === 'queued';
-        if (currentTab === 'downloading') return status === 'downloading' || status === 'postprocessing';
+        if (currentTab === 'downloading') return status === 'downloading' || status === 'postprocessing' || status === 'sent_to_jd2';
         if (currentTab === 'completed') return status === 'completed';
         if (currentTab === 'errors') return status === 'error' || status === 'stalled' || status === 'cancelled';
         if (currentTab === 'duplicates') return status === 'duplicate';
@@ -2650,7 +3268,7 @@ INDEX_HTML = r"""
     };
 
     document.getElementById('sendErrorsToJD').onclick = () => {
-        openConfirmModal('Send all errors to JDownloader2 and remove them from this queue?', async () => {
+        openConfirmModal('Send all errors to JDownloader2? Tube-Q will keep tracking them and run post-processing when each one finishes.', async () => {
             try {
                 const r = await fetch('/jdownloader/send_errors', {method: 'POST'});
                 const j = await r.json();
@@ -2658,7 +3276,7 @@ INDEX_HTML = r"""
                     showToastStyled('JDownloader2: ' + (j.error || 'failed'), 'error');
                     return;
                 }
-                showToastStyled(`Sent ${j.sent} error(s) to JDownloader2`);
+                showToastStyled(`Sending ${j.sent} error(s) to JDownloader2…`);
             } catch (e) {
                 showToastStyled('JDownloader2: request failed', 'error');
             }
@@ -2745,7 +3363,7 @@ INDEX_HTML = r"""
                 showToastStyled('JDownloader2: ' + (j.error || 'failed'), 'error');
                 return;
             }
-            showToastStyled('Sent to JDownloader2');
+            showToastStyled('Sending to JDownloader2…');
         } catch (e) {
             showToastStyled('JDownloader2: request failed', 'error');
         }
@@ -2778,6 +3396,7 @@ INDEX_HTML = r"""
     const settingsTabGeneral = document.getElementById('settingsTabGeneral');
     const settingsTabDomains = document.getElementById('settingsTabDomains');
     const settingsTabJDownloader = document.getElementById('settingsTabJDownloader');
+    const settingsTabFlareSolverr = document.getElementById('settingsTabFlareSolverr');
     const saveSettingsBtn = document.getElementById('saveSettings');
 
     let settingsCache = null;   // will hold the last fetched settings from server
@@ -2791,6 +3410,7 @@ INDEX_HTML = r"""
         settingsTabGeneral.classList.remove('active');
         settingsTabDomains.classList.remove('active');
         settingsTabJDownloader.classList.remove('active');
+        settingsTabFlareSolverr.classList.remove('active');
         tabBtn.classList.add('active');
     }
 
@@ -2806,8 +3426,6 @@ INDEX_HTML = r"""
 
     openSettingsBtn.onclick = async () => {
         settingsOverlay.style.display = 'flex';
-        // set stable height to avoid resizing when swapping content
-        settingsContent.style.minHeight = '30vh';
         // load current config
         const r = await fetch('/settings');
         const cfg = await r.json();
@@ -2848,6 +3466,12 @@ INDEX_HTML = r"""
         setActiveSettingsTab(settingsTabJDownloader);
         const cfg = settingsCache || (await (await fetch('/settings')).json());
         renderSettingsJDownloader(cfg);
+    };
+
+    settingsTabFlareSolverr.onclick = async () => {
+        setActiveSettingsTab(settingsTabFlareSolverr);
+        const cfg = settingsCache || (await (await fetch('/settings')).json());
+        renderSettingsFlareSolverr(cfg);
     };
 
     function IsNumeric(val) {
@@ -2950,7 +3574,7 @@ INDEX_HTML = r"""
         const info = document.createElement('div');
         info.className = 'smallnote';
         info.style.marginTop = '8px';
-        info.textContent = 'Configure domain-specific yt-dlp args. Use comma-separated domains as the key. Example: \"youtube.com, youtu.be\" &#8594; \"--format best\"';
+        info.textContent = 'Configure domain-specific yt-dlp args. Use comma-separated domains as the key. Example: \"youtube.com, youtu.be\" → \"--format best\"';
         container.appendChild(info);
 
         const list = document.createElement('div');
@@ -3171,6 +3795,63 @@ INDEX_HTML = r"""
         };
     }
 
+    function renderSettingsFlareSolverr(cfg) {
+        settingsContent.innerHTML = '';
+        const container = document.createElement('div');
+        const fs = cfg.flaresolverr || {};
+
+        function checkboxRow(id, text, checked) {
+            const row = document.createElement('div');
+            row.style.marginBottom = '6px';
+            const label = document.createElement('label');
+            label.style.display = 'flex';
+            label.style.alignItems = 'center';
+            label.style.gap = '6px';
+            label.style.fontWeight = '500';
+            const input = document.createElement('input');
+            input.type = 'checkbox';
+            input.id = id;
+            input.className = 'toggle';
+            input.checked = !!checked;
+            label.appendChild(input);
+            label.appendChild(document.createTextNode(text));
+            row.appendChild(label);
+            container.appendChild(row);
+            return input;
+        }
+
+        function textRow(id, labelText, value, placeholder) {
+            const row = document.createElement('div');
+            row.style.marginBottom = '6px';
+            const label = document.createElement('label');
+            label.textContent = labelText;
+            label.style.fontWeight = '500';
+            label.style.display = 'block';
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.id = id;
+            input.value = value || '';
+            if (placeholder) input.placeholder = placeholder;
+            row.appendChild(label);
+            row.appendChild(input);
+            container.appendChild(row);
+            return input;
+        }
+
+        const info = document.createElement('div');
+        info.className = 'smallnote';
+        info.textContent = 'When a normal download fails, retry once through a FlareSolverr-backed proxy before falling through to JDownloader2 (if configured) or giving up. Only helps domains blocked by an ordinary auto-resolving Cloudflare challenge -- not sites with their own interactive captcha gate.';
+        container.appendChild(info);
+
+        checkboxRow('fs_enabled', 'Enable FlareSolverr retry', fs.enabled);
+        textRow('fs_mitmproxy_url', 'Proxy address (flaremitm)', fs.mitmproxy_url, 'http://192.168.1.10:8192');
+        textRow('fs_domains', 'Domains to retry through FlareSolverr (comma separated)', fs.domains, 'example.com, example.org');
+        checkboxRow('fs_apply_to_all', 'Apply to all domains (ignores the list above -- adds latency to every retry, not just configured domains)', fs.apply_to_all);
+
+        settingsContent.appendChild(container);
+        attachDirtyListeners(settingsContent);
+    }
+
     saveSettingsBtn.onclick = async () => {
         // gather general
         const newCfg = {};
@@ -3223,6 +3904,17 @@ INDEX_HTML = r"""
                 password: document.getElementById('jd_password').value,
                 device_id: selectedOption ? selectedOption.value : '',
                 device_name: selectedOption ? (selectedOption.dataset.name || selectedOption.textContent || '') : '',
+            };
+        }
+
+        // gather flaresolverr settings if that tab has been rendered
+        const fsEnabledEl = document.getElementById('fs_enabled');
+        if (fsEnabledEl) {
+            payload.flaresolverr = {
+                enabled: fsEnabledEl.checked,
+                mitmproxy_url: document.getElementById('fs_mitmproxy_url').value.trim(),
+                domains: document.getElementById('fs_domains').value.trim(),
+                apply_to_all: document.getElementById('fs_apply_to_all').checked,
             };
         }
         const r = await fetch('/save_settings', {
@@ -3539,6 +4231,7 @@ async def get_settings():
     )
     data['concurrent_downloads_per_domain'] = _to_pos_int(data.get('concurrent_downloads_per_domain', 2), 2)
     data['jdownloader'] = {**DEFAULT_CONFIG['jdownloader'], **(data.get('jdownloader') or {})}
+    data['flaresolverr'] = {**DEFAULT_CONFIG['flaresolverr'], **(data.get('flaresolverr') or {})}
     try:
         default_conf_path = YTDLP_CONFIG_FOLDER / "default.conf"
         if default_conf_path.exists():
@@ -3588,6 +4281,15 @@ async def save_settings(body: Dict[str, Any]):
             'auto_send_errors': bool(jd.get('auto_send_errors', False)),
             'resolution_preference': resolution_pref,
         }
+    # apply flaresolverr settings only if provided (preserve existing otherwise)
+    if 'flaresolverr' in body:
+        fs = body.get('flaresolverr') or {}
+        raw['flaresolverr'] = {
+            'enabled': bool(fs.get('enabled', False)),
+            'mitmproxy_url': str(fs.get('mitmproxy_url', '') or '').strip(),
+            'domains': str(fs.get('domains', '') or ''),
+            'apply_to_all': bool(fs.get('apply_to_all', False)),
+        }
     # persist the default.conf if provided (this makes the UI default section behave like conf/default.conf)
     try:
         if default_conf_text != "":
@@ -3622,6 +4324,7 @@ async def save_settings(body: Dict[str, Any]):
         YT_DLP_PATH = Path(raw.get('yt_dlp_path', str(YT_DLP_PATH)))
         # save in-memory CONFIG
         CONFIG = raw
+        write_flaresolverr_proxy_config()
         await persist_and_publish()
         return JSONResponse({'saved': True})
     except Exception as e:
