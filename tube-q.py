@@ -2,7 +2,7 @@
 """
 Tube-Q : yt-dlp Tube Download Queue
 """
-APP_VERSION = "1.17.1"
+APP_VERSION = "1.17.2"
 APP_GITHUB_REPO = "https://github.com/AnonTester/tube-q"
 APP_GITHUB_COMMITS_API = APP_GITHUB_REPO.replace("https://github.com/", "https://api.github.com/repos/") + "/commits?per_page=1"
 
@@ -1752,6 +1752,17 @@ INDEX_HTML = r"""
         return vw > 0 && vw <= 600;
     }
 
+    // width changes (window resize, orientation change) can flip whether a line is
+    // clipped, so re-evaluate which rows need a hover tooltip
+    let overflowResizeTimer = null;
+    window.addEventListener('resize', () => {
+        clearTimeout(overflowResizeTimer);
+        overflowResizeTimer = setTimeout(() => {
+            const itemsEl = document.getElementById('items');
+            if (itemsEl) refreshOverflowTooltipsIn(itemsEl);
+        }, 150);
+    });
+
     function statusSortRank(status) {
         if (status === 'downloading' || status === 'postprocessing' || status === 'waiting') return 0;
         if (status === 'queued' || status === 'paused') return 1;
@@ -1794,6 +1805,18 @@ INDEX_HTML = r"""
         const meta = statusIconMeta(status);
         const style = meta.inlineStyle ? ` style="${meta.inlineStyle}"` : '';
         return `<span class="${meta.className}" title="${meta.title}"${style}></span>`;
+    }
+
+    function shortenErrorText(text) {
+        if (!text) return text;
+        let s = String(text);
+        // drop "(caused by <...>)" suffix -- redundant with the message before it
+        s = s.replace(/\s*\(caused by <[^>]*>\)\s*$/i, '');
+        // drop "[Extractor] optional-id: " boilerplate right after "ERROR: "
+        s = s.replace(/^(ERROR:\s*)\[[^\]]+\]\s*(?:[^:]+:\s*)?/i, '$1');
+        // drop redundant "Unable to download webpage: " / "Unable to extract ...: " boilerplate
+        s = s.replace(/^(ERROR:\s*)Unable to [^:]+:\s*/i, '$1');
+        return s;
     }
 
     function truncateSingleLine(str, maxChars) {
@@ -1840,23 +1863,29 @@ INDEX_HTML = r"""
         const etaText = it.progress && it.progress.eta ? `ETA: ${it.progress.eta}` : '';
 
         let smallText = '';
+        let smallTextFull = '';
         if (it.error && it.last_output) {
-            smallText = truncateSingleLine(it.last_output, 120);
+            smallTextFull = shortenErrorText(it.last_output);
+            smallText = truncateSingleLine(smallTextFull, 120);
         } else if (it.progress && it.progress.status === 'postprocessing' && it.progress.detail) {
             // show current post-processing log line to indicate what is being worked on
-            smallText = truncateSingleLine(it.progress.detail, 120);
+            smallTextFull = it.progress.detail;
+            smallText = truncateSingleLine(smallTextFull, 120);
         } else if (status === 'downloading' || status === 'postprocessing' || (it.progress && it.progress.status === 'waiting')) {
             const progressLine = [status];
             if (pctText) progressLine.push(pctText);
             if (etaText) progressLine.push(etaText);
             smallText = progressLine.join(' • ');
+            smallTextFull = smallText;
         } else {
             smallText = status;
+            smallTextFull = status;
         }
         return {
             pct,
             showProgress: Boolean(it.progress || activeProgress),
             smallText,
+            smallTextFull,
         };
     }
 
@@ -1869,7 +1898,7 @@ INDEX_HTML = r"""
         const rightButtons = buildRightButtonsHTML(id, status, mobile);
         const m = getItemRenderModel(it, status);
         const progressHTML = m.showProgress ? `<div class="progress"><div class="fill" style="width:${m.pct}%"></div></div>` : '';
-        const smallText = `<div class="small">${escapeHtml(m.smallText)}</div>`;
+        const smallText = `<div class="small" data-full="${escapeHtml(m.smallTextFull)}">${escapeHtml(m.smallText)}</div>`;
 
         if (!mobile) {
             // desktop interface
@@ -1958,6 +1987,7 @@ INDEX_HTML = r"""
                 metaCol.appendChild(smallEl);
             }
             if (smallEl.textContent !== m.smallText) smallEl.textContent = m.smallText;
+            if (smallEl.getAttribute('data-full') !== m.smallTextFull) smallEl.setAttribute('data-full', m.smallTextFull);
 
             let progressEl = li.querySelector('.meta-col .progress');
             if (m.showProgress) {
@@ -1995,6 +2025,32 @@ INDEX_HTML = r"""
                 sel._attached = true;
             }
         }
+
+        // li may not be attached to the document yet (e.g. fullRender/incrementalUpdate
+        // build rows before inserting them) -- in that case scrollWidth/clientWidth would
+        // read as 0, so skip here and let the caller run a batch pass once rows are in the DOM.
+        if (li.isConnected) refreshOverflowTooltipsIn(li);
+    }
+
+    // set a title attribute (native hover tooltip) only on elements whose single-line
+    // text is actually clipped by CSS ellipsis -- never on ones that already fit.
+    function refreshOverflowTooltip(el) {
+        if (!el) return;
+        const full = el.hasAttribute('data-full') ? el.getAttribute('data-full') : el.textContent;
+        // horizontal overflow: single-line ellipsis (desktop); vertical overflow: the
+        // 2-line -webkit-line-clamp used for URLs on narrow/mobile layouts
+        const clipped = el.scrollWidth > el.clientWidth + 1 || el.scrollHeight > el.clientHeight + 1;
+        if (clipped) {
+            if (el.getAttribute('title') !== full) el.setAttribute('title', full);
+        } else if (el.hasAttribute('title')) {
+            el.removeAttribute('title');
+        }
+    }
+
+    function refreshOverflowTooltipsIn(scopeEl) {
+        if (!scopeEl) return;
+        scopeEl.querySelectorAll('.url-text').forEach(refreshOverflowTooltip);
+        scopeEl.querySelectorAll('.meta-col .small').forEach(refreshOverflowTooltip);
     }
 
     // very small html escape helper for injected text
@@ -2073,6 +2129,7 @@ INDEX_HTML = r"""
         // Re-apply active-tab filtering whenever statuses change.
         filterView();
         attachSelectionHandlers();
+        refreshOverflowTooltipsIn(itemsEl);
     }
 
     function incrementalUpdate(st) {
@@ -2157,6 +2214,7 @@ INDEX_HTML = r"""
         // Re-apply active-tab filtering whenever statuses change.
         filterView();
         attachSelectionHandlers();
+        refreshOverflowTooltipsIn(itemsEl);
         if (orderChanged) restoreQueueScrollAnchor(scrollAnchor);
     }
 
