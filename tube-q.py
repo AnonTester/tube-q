@@ -2,7 +2,7 @@
 """
 Tube-Q : yt-dlp Tube Download Queue
 """
-APP_VERSION = "1.18.0"
+APP_VERSION = "1.18.1"
 APP_GITHUB_REPO = "https://github.com/AnonTester/tube-q"
 APP_GITHUB_COMMITS_API = APP_GITHUB_REPO.replace("https://github.com/", "https://api.github.com/repos/") + "/commits?per_page=1"
 
@@ -553,6 +553,19 @@ class JDownloaderClient:
         }]) or []
 
 
+def _write_jd2_error_log(id_: str, message: str):
+    """Write a JDownloader2 handoff failure to the item's log file so the log
+    button has something to show -- these failures happen before any yt-dlp
+    process exists, so there's otherwise no log content for them at all."""
+    lf = LOGS_DIR / f"{id_}.log"
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with lf.open("a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {message}\n")
+    except Exception:
+        pass
+
+
 async def send_queue_ids_to_jdownloader(ids: List[str]) -> Dict[str, Any]:
     """Validate JDownloader2 is configured, mark the given queue items as being
     submitted, and kick off a background task that actually does the handoff.
@@ -628,7 +641,9 @@ async def _submit_ids_to_jdownloader(ids: List[str], email: str, password: str, 
                     it['status'] = 'error'
                     it['error'] = (f'JDownloader2 submit failed: {submit_error}' if submit_error
                                     else 'JDownloader2 found no downloadable video at this URL')
+                    it['last_output'] = it['error']
                     it.pop('progress', None)
+                    _write_jd2_error_log(id_, it['error'])
                 else:
                     # a single-url submission should land in one package; if jd2 ever
                     # splits it across several, only the first is tracked -- fine in
@@ -659,7 +674,9 @@ async def _submit_ids_to_jdownloader(ids: List[str], email: str, password: str, 
             if it and it.get('status') == 'sent_to_jd2' and not it.get('jd2_package_uuid'):
                 it['status'] = 'error'
                 it['error'] = f'JDownloader2 connection failed: {e}'
+                it['last_output'] = it['error']
                 it.pop('progress', None)
+                _write_jd2_error_log(id_, it['error'])
                 QUEUE_STATE[id_] = it
         await persist_and_publish()
 
@@ -1498,7 +1515,9 @@ async def jd2_poller():
                     if it and it.get('status') == 'sent_to_jd2':
                         it['status'] = 'error'
                         it['error'] = 'JDownloader2 package no longer in download list (removed or cleared before finishing)'
+                        it['last_output'] = it['error']
                         it.pop('progress', None)
+                        _write_jd2_error_log(id_, it['error'])
                         QUEUE_STATE[id_] = it
                         await persist_and_publish()
                     continue
