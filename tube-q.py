@@ -2,7 +2,7 @@
 """
 Tube-Q : yt-dlp Tube Download Queue
 """
-APP_VERSION = "1.18.1"
+APP_VERSION = "1.18.2"
 APP_GITHUB_REPO = "https://github.com/AnonTester/tube-q"
 APP_GITHUB_COMMITS_API = APP_GITHUB_REPO.replace("https://github.com/", "https://api.github.com/repos/") + "/commits?per_page=1"
 
@@ -462,11 +462,13 @@ class JDownloaderClient:
         """Add the given urls to the link grabber, keep only recognized video links
         (filtered by extension and resolution preference), move them to the download
         list and start downloading. Returns the linkgrabber records (uuid, name,
-        packageUUID) of the links that were kept and moved to the download list, so
-        callers can track those specific downloads to completion -- callers that need
-        reliable per-url attribution should call this once per url rather than
-        batching multiple urls into one call, since the before/after diff below can't
-        otherwise tell which resulting links came from which submitted url."""
+        packageUUID) of the links that were kept and moved to the download list, each
+        also carrying a 'dlPackageUUID' field -- the *download-list* package uuid
+        (see below for why this differs from 'packageUUID' and is the one callers
+        should actually track) -- callers that need reliable per-url attribution
+        should call this once per url rather than batching multiple urls into one
+        call, since the before/after diffing below can't otherwise tell which
+        resulting links/packages came from which submitted url."""
         # snapshot the current link grabber contents so we can identify which
         # links result from this addLinks call, regardless of how JDownloader
         # groups/names the resulting package(s)
@@ -529,11 +531,29 @@ class JDownloaderClient:
         if discard_ids:
             await self._device_action(device_id, "/linkgrabberv2/removeLinks", [discard_ids, []])
 
+        dl_uuid = None
         if keep_ids:
+            # linkgrabberv2's packageUUID (on the links queried above) identifies the
+            # package only within the link grabber -- moveToDownloadlist creates a
+            # *new*, differently-uuid'd package object in the download list, so that
+            # linkgrabber-side uuid can never be found via downloadsV2/queryPackages
+            # afterwards. Snapshot the download list before the move and diff it
+            # after to learn the real uuid our caller needs to poll on.
+            dl_before = {p.get("uuid") for p in await self.query_download_packages(device_id)}
             await self._device_action(device_id, "/linkgrabberv2/moveToDownloadlist", [keep_ids, []])
             await self._device_action(device_id, "/downloadcontroller/start", None)
+            for _ in range(10):
+                await asyncio.sleep(0.5)
+                dl_after = await self.query_download_packages(device_id)
+                new_dl_uuids = [p.get("uuid") for p in dl_after if p.get("uuid") not in dl_before]
+                if new_dl_uuids:
+                    dl_uuid = new_dl_uuids[0]
+                    break
 
-        return [link for link in new_links if link["uuid"] in set(keep_ids)]
+        kept_links = [link for link in new_links if link["uuid"] in set(keep_ids)]
+        for link in kept_links:
+            link["dlPackageUUID"] = dl_uuid
+        return kept_links
 
     async def query_download_packages(self, device_id: str) -> List[Dict[str, Any]]:
         """Return every package currently in the download list (not the link
@@ -637,10 +657,15 @@ async def _submit_ids_to_jdownloader(ids: List[str], email: str, password: str, 
                 it = QUEUE_STATE.get(id_)
                 if not it:
                     continue
-                if not kept_links:
+                dl_package_uuid = kept_links[0].get('dlPackageUUID') if kept_links else None
+                if not kept_links or not dl_package_uuid:
                     it['status'] = 'error'
-                    it['error'] = (f'JDownloader2 submit failed: {submit_error}' if submit_error
-                                    else 'JDownloader2 found no downloadable video at this URL')
+                    if submit_error:
+                        it['error'] = f'JDownloader2 submit failed: {submit_error}'
+                    elif not kept_links:
+                        it['error'] = 'JDownloader2 found no downloadable video at this URL'
+                    else:
+                        it['error'] = 'JDownloader2 accepted the link but its download-list package could not be identified'
                     it['last_output'] = it['error']
                     it.pop('progress', None)
                     _write_jd2_error_log(id_, it['error'])
@@ -650,7 +675,7 @@ async def _submit_ids_to_jdownloader(ids: List[str], email: str, password: str, 
                     # practice since select_resolution_discards() already trims to one
                     # preferred file per video, so multiple packages here would be
                     # unusual rather than the normal case
-                    it['jd2_package_uuid'] = kept_links[0].get('packageUUID')
+                    it['jd2_package_uuid'] = dl_package_uuid
                     it['jd2_link_names'] = [l.get('name') for l in kept_links if l.get('name')]
                     it['jd2_device_id'] = device_id
                     it['jd2_submitted_at'] = int(time.time())
@@ -1475,9 +1500,9 @@ async def jd2_poller():
     off to postprocess_jd2_download(). If a tracked package disappears from jd2's
     download list before finishing (removed/cancelled in jd2, or an unexpected
     packagizer/cleanup interaction) the item is marked as an error rather than left
-    stuck forever -- there's no reliable way to tell that apart from "jd2 already
-    finished and auto-cleared the entry" from this API alone, but jd2 doesn't
-    auto-clear finished downloads by default, so this should be rare."""
+    stuck forever, but only after it's missing on two consecutive polls -- a single
+    miss is treated as My.JDownloader cloud-relay lag rather than a real removal
+    (see jd2_missing_since below)."""
     while True:
         await asyncio.sleep(25)
         try:
@@ -1513,14 +1538,28 @@ async def jd2_poller():
                 if not pkg:
                     it = QUEUE_STATE.get(id_)
                     if it and it.get('status') == 'sent_to_jd2':
-                        it['status'] = 'error'
-                        it['error'] = 'JDownloader2 package no longer in download list (removed or cleared before finishing)'
-                        it['last_output'] = it['error']
-                        it.pop('progress', None)
-                        _write_jd2_error_log(id_, it['error'])
-                        QUEUE_STATE[id_] = it
-                        await persist_and_publish()
+                        # My.JDownloader's cloud relay can lag a few seconds behind a
+                        # package that was *just* created (moveToDownloadlist), so a
+                        # single miss right after submission isn't reliable evidence
+                        # it's gone -- only error out once it's been missing across
+                        # two consecutive polls (~25-50s apart).
+                        if not it.get('jd2_missing_since'):
+                            it['jd2_missing_since'] = int(time.time())
+                            QUEUE_STATE[id_] = it
+                        else:
+                            it['status'] = 'error'
+                            it['error'] = 'JDownloader2 package no longer in download list (removed or cleared before finishing)'
+                            it['last_output'] = it['error']
+                            it.pop('progress', None)
+                            it.pop('jd2_missing_since', None)
+                            _write_jd2_error_log(id_, it['error'])
+                            QUEUE_STATE[id_] = it
+                            await persist_and_publish()
                     continue
+
+                if it.get('jd2_missing_since'):
+                    it.pop('jd2_missing_since', None)
+                    QUEUE_STATE[id_] = it
 
                 if pkg.get('finished'):
                     it = QUEUE_STATE.get(id_)
@@ -4400,6 +4439,39 @@ async def jdownloader_send_one(id_: str):
     except Exception as e:
         return JSONResponse({'error': str(e)}, status_code=502)
     return JSONResponse(result)
+
+
+@app.post('/jdownloader/attach/{id_}')
+async def jdownloader_attach(id_: str, package_uuid: int = Query(...),
+                              filename: Optional[str] = Query(None)):
+    """Attach a queue item to a JDownloader2 download-list package that already
+    exists (e.g. one started manually in jd2's own UI, working around its
+    link-grabber history silently blocking a normal addLinks resubmission)
+    instead of submitting a fresh link. Lets jd2_poller() pick it up and
+    post-process it exactly like a normal submission would. filename should be
+    the exact downloaded filename when the package's saveTo folder holds more
+    than one video file, so _jd2_resolve_downloaded_file() can match the right
+    one instead of falling back to "largest file in the folder"."""
+    it = QUEUE_STATE.get(id_)
+    if not it or not it.get('url'):
+        raise HTTPException(404, 'not found')
+    jd_cfg = CONFIG.get('jdownloader') or {}
+    it['status'] = 'sent_to_jd2'
+    it['jd2_package_uuid'] = package_uuid
+    it['jd2_device_id'] = jd_cfg.get('device_id') or ''
+    it['jd2_submitted_at'] = int(time.time())
+    if filename:
+        it['jd2_link_names'] = [filename]
+    it.pop('error', None)
+    it.pop('last_output', None)
+    it.pop('jd2_missing_since', None)
+    it['progress'] = {
+        "percent": 0.0, "eta": None, "speed": None,
+        "status": "downloading", "detail": "attached to existing JDownloader2 package",
+    }
+    QUEUE_STATE[id_] = it
+    await persist_and_publish()
+    return JSONResponse({'attached': id_, 'jd2_package_uuid': package_uuid})
 
 
 # add endpoint
