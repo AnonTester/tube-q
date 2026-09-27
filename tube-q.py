@@ -2,7 +2,7 @@
 """
 Tube-Q : yt-dlp Tube Download Queue
 """
-APP_VERSION = "1.18.2"
+APP_VERSION = "1.18.3"
 APP_GITHUB_REPO = "https://github.com/AnonTester/tube-q"
 APP_GITHUB_COMMITS_API = APP_GITHUB_REPO.replace("https://github.com/", "https://api.github.com/repos/") + "/commits?per_page=1"
 
@@ -224,7 +224,57 @@ subscribers: List[asyncio.Queue] = []
 yt_dlp_version: Optional[str] = None
 
 # parse post processing patterns
-POSTPROC_INDICATORS = ["[Merger]", "[ExtractAudio]", "[Postprocessor]", "[ffmpeg]", "Merging formats", "[Exec]"]
+POSTPROC_INDICATORS = ["[Merger]", "[ExtractAudio]", "[Postprocessor]", "[ffmpeg]", "Merging formats", "[Exec]",
+                       "frame="]
+
+_LINE_SEP_RE = re.compile(rb"\r\n|\n|\r")
+
+
+async def iter_output_lines(stream: asyncio.StreamReader, cr_interval: float = 5.0):
+    """Yield the child's output as newline-terminated byte lines.
+
+    StreamReader.readline() only splits on '\\n' and raises once a single "line"
+    exceeds the stream limit. Tools that redraw a live status line with '\\r'
+    (ffmpeg's frame=/size=/time= stats, spawned via yt-dlp --exec) never emit
+    '\\n', so readline() overflowed, the caller gave up reading, and the child
+    then blocked forever on a full pipe. Here '\\r' is treated as a line break;
+    since '\\r'-terminated segments are just progress redraws they are throttled
+    to one per cr_interval seconds so the log doesn't fill with them."""
+    buf = b""
+    last_cr = 0.0
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            break
+        buf += chunk
+        while True:
+            m = _LINE_SEP_RE.search(buf)
+            if not m:
+                break
+            if m.group() == b"\r" and m.end() == len(buf):
+                break  # might be the first half of a '\r\n' split across reads
+            seg, buf = buf[:m.start()], buf[m.end():]
+            if m.group() == b"\r":
+                now = time.monotonic()
+                if now - last_cr < cr_interval:
+                    continue
+                last_cr = now
+            yield seg + b"\n"
+        if len(buf) > 1024 * 1024:  # pathological output with no separator at all
+            yield buf + b"\n"
+            buf = b""
+    if buf:
+        yield buf.rstrip(b"\r") + b"\n"
+
+
+async def drain_output(proc, lf):
+    """Keep reading a child's output (into the log) after the normal reader loop
+    bailed out on an error -- otherwise the child blocks on a full pipe forever."""
+    try:
+        async for raw in iter_output_lines(proc.stdout):
+            lf.write(raw)
+    except Exception:
+        pass
 
 
 # === Check if in docker ===
@@ -1021,6 +1071,7 @@ async def retry_yt_dlp_with_flaresolverr(item: Dict[str, Any], url: str, log_pat
         await publish_item_update(id_, progress=progress)
 
     rc = -1
+    proc = None
     with log_path.open("ab") as lf:
         lf.write(("Log start (FlareSolverr retry): " +
                    datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n").encode("UTF-8"))
@@ -1043,10 +1094,7 @@ async def retry_yt_dlp_with_flaresolverr(item: Dict[str, Any], url: str, log_pat
             except Exception:
                 DOWNLOADS[id_] = {"item": item, "progress": progress, "process": proc}
 
-            while True:
-                raw = await proc.stdout.readline()
-                if not raw:
-                    break
+            async for raw in iter_output_lines(proc.stdout):
                 await asyncio.sleep(0)
                 try:
                     lf.write(raw)
@@ -1077,6 +1125,9 @@ async def retry_yt_dlp_with_flaresolverr(item: Dict[str, Any], url: str, log_pat
             rc = await proc.wait()
         except Exception as e:
             lf.write(f"[error] failed to run yt-dlp: {e}\n".encode("UTF-8"))
+            if proc is not None:
+                await drain_output(proc, lf)
+                rc = await proc.wait()
 
         lf.write(("Log end: " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n").encode("UTF-8"))
         lf.write(b"--------\n")
@@ -1218,10 +1269,7 @@ async def run_yt_dlp_for_item(item: Dict[str, Any]):
             DOWNLOADS[id_] = {"item": item, "progress": progress, "process": proc}
 
         try:
-            while True:
-                raw = await proc.stdout.readline()
-                if not raw:
-                    break
+            async for raw in iter_output_lines(proc.stdout):
                 await asyncio.sleep(0)  # yield to event-loop for smoother updates
                 try:
                     lf.write(raw)
@@ -1274,6 +1322,7 @@ async def run_yt_dlp_for_item(item: Dict[str, Any]):
             progress["status"] = "error"
             progress["detail"] = f"progress parser error: {e}"
             await maybe_publish_progress(force=True)
+            await drain_output(proc, lf)
 
         rc = await proc.wait()
         # cleanup running record
@@ -1392,6 +1441,7 @@ async def postprocess_jd2_download(id_: str, saved_path: str):
 
         env = dict(**os.environ)
         env["PYTHONUNBUFFERED"] = "1"
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *ytdlp_args,
@@ -1400,10 +1450,7 @@ async def postprocess_jd2_download(id_: str, saved_path: str):
                 env=env,
                 start_new_session=True,
             )
-            while True:
-                raw = await proc.stdout.readline()
-                if not raw:
-                    break
+            async for raw in iter_output_lines(proc.stdout):
                 try:
                     lf.write(raw)
                     lf.flush()
@@ -1413,6 +1460,9 @@ async def postprocess_jd2_download(id_: str, saved_path: str):
         except Exception as e:
             rc = -1
             lf.write(f"[error] failed to run yt-dlp: {e}\n".encode('UTF-8'))
+            if proc is not None:
+                await drain_output(proc, lf)
+                rc = await proc.wait()
 
         lf.write(("Log end: " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n").encode('UTF-8'))
         lf.write(b"--------\n")
@@ -2488,8 +2538,9 @@ INDEX_HTML = r"""
         let s = String(text);
         // drop "(caused by <...>)" suffix -- redundant with the message before it
         s = s.replace(/\s*\(caused by <[^>]*>\)\s*$/i, '');
-        // drop "[Extractor] optional-id: " boilerplate right after "ERROR: "
-        s = s.replace(/^(ERROR:\s*)\[[^\]]+\]\s*(?:[^:]+:\s*)?/i, '$1');
+        // drop "[Extractor] optional-id: " boilerplate right after "ERROR: " -- the id is a single
+        // token (no spaces), otherwise this would also swallow the message up to any later colon
+        s = s.replace(/^(ERROR:\s*)\[[^\]]+\]\s*(?:[^\s:]+:\s+)?/i, '$1');
         // drop redundant "Unable to download webpage: " / "Unable to extract ...: " boilerplate
         s = s.replace(/^(ERROR:\s*)Unable to [^:]+:\s*/i, '$1');
         return s;
