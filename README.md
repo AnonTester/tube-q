@@ -175,6 +175,18 @@ Example Tube-Q defaults:
 }
 ```
 
+Tube-Q passes `--trim-filenames 200` to yt-dlp by default so very long titles
+can't exceed the filesystem's 255-byte filename limit (`File name too long`).
+Add your own `--trim-filenames N` to `yt_dlp_global_args` or a domain override
+to change it. The limit counts characters, not bytes, so keep
+`--restrict-filenames` (ASCII-only names) in your global args if titles may
+contain non-Latin text.
+
+The FlareSolverr retry additionally passes `--socket-timeout 90` (yt-dlp's default
+is 20s), because a cold Cloudflare challenge solve can take longer than that. Add
+your own `--socket-timeout N` to `yt_dlp_global_args` or a domain override to
+change it.
+
 
 ## 🧰 JDownloader2 backup
 

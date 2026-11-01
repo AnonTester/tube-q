@@ -16,19 +16,34 @@ MITM-capable proxy engine) with a small custom addon
 - Terminates TLS itself for configured domains (mitmproxy's self-signed CA;
   works without any client-side cert trust setup as long as the client
   doesn't validate certificates -- e.g. yt-dlp with `--no-check-certificates`,
-  already the default in Tube-Q's config) and swaps the real network fetch
-  for a FlareSolverr-resolved one.
+  already the default in Tube-Q's config).
+- Uses FlareSolverr to *solve* the challenge, then gets out of the way. The
+  first request to a configured host is fetched through FlareSolverr; the
+  clearance cookies and user agent it obtained are remembered per host and
+  injected into every later request to that host, which is then passed
+  through to the origin normally. This matters because FlareSolverr's
+  browser-rendered response is only faithful for HTML/JSON: a redirect to a
+  video file comes back as a small HTML player page instead of the real
+  bytes. With passthrough, redirects and binary downloads work, large
+  bodies are streamed rather than buffered, and a follow-up AJAX/API call
+  made by an extractor carries the same clearance as the page fetch.
+- If a passed-through request is challenged again (e.g. the cookie expired
+  or was rejected), the stored clearance is dropped and that request is
+  re-solved through FlareSolverr.
+- Never hands back FlareSolverr's media-player wrapper as if it were a file.
+  When a browser navigates straight to a media URL it renders a small
+  `<video>` page instead of delivering the bytes, so a download that needs a
+  fresh solve (the very first request to a host, or a resume after the stored
+  clearance stopped working) would otherwise "succeed" with a tiny HTML file
+  saved under the video's name. The add-on detects that wrapper and answers
+  with a redirect to the media location it names -- what the origin would have
+  sent -- or, if it can't resolve it, a `502` instead of the wrapper.
+- Streams upstream responses through instead of buffering them, so a large
+  download isn't held back until the whole file has arrived.
 - Leaves every other domain alone (mitmproxy's normal passthrough) --
   in particular this means the actual video/CDN download, which typically
   happens on a *different*, non-Cloudflare-protected domain, is not slowed
   down or routed through FlareSolverr at all.
-- Carries cookies across requests to the same domain. This matters because
-  some sites only send a challenge on the *first* request (the page fetch);
-  a follow-up AJAX/API call the page's own JS would make needs the same
-  challenge cookie to also get through. Confirmed necessary for sites whose
-  extractor does a page-fetch, then a separate follow-up API call to resolve
-  the actual video URLs -- both requests need to go through FlareSolverr
-  with the same cookies for it to work end to end.
 - Unwraps FlareSolverr's response when it's actually JSON: when a real
   browser navigates directly to a JSON endpoint, it gets wrapped in the
   browser's own "raw JSON viewer" HTML (`<html>...<body><pre>{...}</pre>...`).

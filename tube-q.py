@@ -2,7 +2,7 @@
 """
 Tube-Q : yt-dlp Tube Download Queue
 """
-APP_VERSION = "1.18.3"
+APP_VERSION = "1.18.7"
 APP_GITHUB_REPO = "https://github.com/AnonTester/tube-q"
 APP_GITHUB_COMMITS_API = APP_GITHUB_REPO.replace("https://github.com/", "https://api.github.com/repos/") + "/commits?per_page=1"
 
@@ -114,6 +114,16 @@ HISTORY_PATH = Path(CONFIG.get("history_file"))
 # unified queue state file (single JSON map: id -> item)
 YT_DLP_PATH = Path(CONFIG.get("yt_dlp_path", str(CONF_DIR / "yt-dlp")))
 YT_DLP_GLOBAL_ARGS = CONFIG.get("yt_dlp_global_args", []) or []
+# Filesystems cap a single filename at 255 bytes, and some sites have very long
+# titles (sometimes hundreds of characters). Trim the filename stem so the
+# download (plus yt-dlp's temp suffixes like .part/.ytdl/-FragN) always fits.
+# Passed before the global args and --config-location so either can override it.
+YT_DLP_DEFAULT_ARGS = ["--trim-filenames", "200"]
+# Requests through the FlareSolverr proxy can legitimately take much longer than
+# yt-dlp's default 20s socket timeout: a cold Cloudflare challenge solve runs up to
+# ~60s, and a download resume may have to wait for a fresh solve. Only used on the
+# FlareSolverr retry; same override rules as above.
+FLARESOLVERR_YT_DLP_ARGS = ["--socket-timeout", "90"]
 CONCURRENT_DOWNLOADS_GLOBAL = _to_pos_int(
     CONFIG.get("concurrent_downloads_global", CONFIG.get("concurrent_downloads", 10)),
     10
@@ -1029,7 +1039,7 @@ async def retry_yt_dlp_with_flaresolverr(item: Dict[str, Any], url: str, log_pat
         return False
 
     bin_exec = str(YT_DLP_PATH) if YT_DLP_PATH.exists() else YT_DLP_BINARY
-    ytdlp_args = [bin_exec, "--newline"]
+    ytdlp_args = [bin_exec, "--newline"] + YT_DLP_DEFAULT_ARGS + FLARESOLVERR_YT_DLP_ARGS
     if YT_DLP_GLOBAL_ARGS:
         ytdlp_args += YT_DLP_GLOBAL_ARGS
     ytdlp_args += ["--config-location", str(patched_cfg_path), url]
@@ -1219,7 +1229,7 @@ async def run_yt_dlp_for_item(item: Dict[str, Any]):
         cfg = choose_config_for_url(url)
         # prefer configured local binary path if it exists, otherwise binary name
         bin_exec = str(YT_DLP_PATH) if YT_DLP_PATH.exists() else YT_DLP_BINARY
-        ytdlp_args = [bin_exec, "--newline"]
+        ytdlp_args = [bin_exec, "--newline"] + YT_DLP_DEFAULT_ARGS
         if YT_DLP_GLOBAL_ARGS:
             ytdlp_args += YT_DLP_GLOBAL_ARGS
         if cfg:
